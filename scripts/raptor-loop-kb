@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""raptor-loop-kb — deterministic MONOTONIC-SCRUTINY cross-run KB for raptor-loop-hunt.
+
+Security invariant (the whole safety case): the KB can only ever RAISE hunt
+scrutiny, never lower it. It stores NO coverage state, NO "this is safe"
+signal, and performs NO deprioritization or exclusion. It emits exactly two
+things, both of which only INCREASE effort:
+
+  (1) confirmed-dirty component  -> hunt-FIRST priority   (sourced ONLY from a
+      finding_outcome with disposition confirmed/corrected — a post-adjudication
+      fact that already passed judge + live-verify).
+  (2) prior-rejection            -> a "recheck X AND every delivery vector"
+      ANNOTATION (never an exclusion). needs_live / incomplete -> open_items,
+      re-driven.
+
+Corollary: even a maximally poisoned or stale KB cannot cause a false negative.
+A forged steering record can only add a "hunt this more" note; worst case it
+wastes budget re-hunting a real component. Current-run coverage is ALWAYS
+computed fresh from this run's TRIED.md; the KB never touches it. KB output is
+planner/orchestrator context ONLY; never fed to generator/judge/verifier.
+
+Subcommands:
+  identity   --target DIR
+  append     --kb KB_ROOT --target DIR [--record JSON | --file F | -]   (locked)
+  reflect    RUN_DIR --kb KB_ROOT --target DIR [--max-chars N]          (locked append)
+  synthesize --kb KB_ROOT --target DIR --inventory FILE --run-id R      (rotate+fold, atomic)
+  load       --kb KB_ROOT --target DIR --inventory FILE                 (drift recomputed here)
+
+Pure stdlib. No RAPTOR imports, no sys.path manipulation.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+METHODOLOGY_VERSION = "kb-v3"
+SCHEMA_VERSION = 3
+
+# ---- global bounds (every durable collection + every read) --------------------
+MAX_INBOX_BYTES = 4 * 1024 * 1024
+MAX_LINE_BYTES = 256 * 1024
+MAX_TRAJECTORY_BYTES = 16 * 1024 * 1024
+MAX_KB_BYTES = 64 * 1024 * 1024
+MAX_RECORDS_PER_RUN = 5000
+MAX_FIELD_CHARS = 500
+MAX_LIST_LEN = 16
+MAX_COMPONENTS = 100000
+MAX_COMPONENT_NAME = 256
+MAX_PRIOR_REJECTIONS = 5000
+MAX_OPEN_ITEMS = 5000
+MAX_VULN_CLASSES = 2000
+MAX_TELEMETRY = 500
+MAX_RUNS_FOLDED = 4096
+EXPIRY_DAYS = 90
+
+_ENUM_DISPOSITION = {"confirmed", "needs_live_validation", "rejected", "corrected"}
+_ENUM_EVIDENCE_ROLE = {"source", "caller", "route", "mitigation"}
+_GIVEUP = re.compile(
+    r"\b(i cannot determine|i am stuck|unable to|give up|gave up|no vulnerab"
+    r"|not reachable|dead code|false positive|cannot confirm|out of scope"
+    r"|needs live|ran out of|remains uncovered|could not reach)\b", re.I)
+
+
+# ============================ shared helpers ===================================
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _cap(text, n: int = MAX_FIELD_CHARS) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[:max(0, n - 1)] + "…"  # stays within n
+
+
+def _run_git(target: Path, *args: str) -> str:
+    try:
+        out = subprocess.run(["git", "-C", str(target), *args],
+                             capture_output=True, text=True, timeout=20)
+        return out.stdout if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _walk_files(target: Path, basenames: set[str], cap: int = 4000) -> str:
+    """Recursively hash every file whose basename is in `basenames` (nested
+    poms/lockfiles/build files — drift completeness, review §4.10). Bounded."""
+    h = hashlib.sha256()
+    n = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(target):
+            dirnames[:] = sorted(d for d in dirnames
+                                 if d not in (".git", "node_modules", ".hg", ".svn"))
+            for fn in sorted(filenames):
+                if fn in basenames:
+                    p = Path(dirpath) / fn
+                    try:
+                        if p.is_file() and not p.is_symlink():
+                            rel = os.path.relpath(p, target)
+                            h.update(rel.encode()); h.update(p.read_bytes())
+                            n += 1
+                            if n >= cap:
+                                return h.hexdigest()[:16]
+                    except Exception:
+                        continue
+    except Exception:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def _dirty_content_digest(target: Path) -> str:
+    """Content-sensitive dirty digest: `git diff HEAD` (tracked modifications)
+    + untracked file content, bounded. Beats `git status --porcelain`, which
+    records paths/status, not modified CONTENT (review §4.10)."""
+    diff = _run_git(target, "diff", "HEAD")[:MAX_TRAJECTORY_BYTES]
+    h = hashlib.sha256(diff.encode())
+    porcelain = _run_git(target, "status", "--porcelain", "-uall")
+    for ln in porcelain.splitlines()[:2000]:
+        if ln.startswith("??"):
+            rel = ln[3:].strip()
+            p = _resolve_under_root(target, rel)
+            try:
+                if p and p.is_file() and p.stat().st_size < 1024 * 1024:
+                    h.update(rel.encode()); h.update(p.read_bytes())
+            except Exception:
+                continue
+    return h.hexdigest()[:16]
+
+
+def compute_identity(target: Path, inventory: list[str] | None = None) -> dict:
+    real = os.path.realpath(target)
+    inv = inventory or []
+    build = {"CMakeLists.txt", "Makefile", "pom.xml", "build.gradle",
+             "package.json", "Cargo.toml", "go.mod", "pyproject.toml",
+             "setup.py", "BUILD", "BUILD.bazel", "meson.build"}
+    locks = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+             "Cargo.lock", "go.sum", "requirements.txt", "Gemfile.lock",
+             "composer.lock", "pom.xml"}
+    return {
+        "target_path_id": _sha(real.encode())[:16],
+        "vcs_commit": _run_git(target, "rev-parse", "HEAD").strip(),
+        "dirty_tree_digest": _dirty_content_digest(target),
+        "inventory_digest": _sha("\n".join(sorted(inv)).encode())[:16],
+        "build_config_digest": _walk_files(target, build),
+        "dependency_digest": _walk_files(target, locks),
+        "release_label": _run_git(target, "describe", "--tags", "--always").strip(),
+        "methodology_version": METHODOLOGY_VERSION,
+    }
+
+
+def _resolve_under_root(target_root: Path, rel: str):
+    if not isinstance(rel, str) or not rel:
+        return None
+    root = os.path.realpath(target_root)
+    cand = os.path.realpath(os.path.join(root, rel))
+    if cand == root or cand.startswith(root + os.sep):
+        return Path(cand)
+    return None
+
+
+def _span_digest(target_root: Path, span: dict):
+    if not isinstance(span, dict):
+        return None
+    p = _resolve_under_root(target_root, span.get("file", ""))
+    if p is None or not p.is_file():
+        return None
+    try:
+        lines = p.read_text(errors="replace").splitlines()
+        s = max(1, int(span.get("start_line", 1)))
+        e = int(span.get("end_line", s))
+    except Exception:
+        return None
+    chunk = "\n".join(ln.rstrip() for ln in lines[s - 1:e])
+    return _sha(chunk.encode())[:12]
+
+
+# ====================== trusted-storage hardening ==============================
+
+def assert_safe_kb_root(kb_root: Path, target_root) -> Path:
+    """Refuse a symlinked KB path, a KB inside the scanned target, or one not
+    owned by us. Validates EVERY path component with lstat (no symlink follow).
+    Returns the absolute kb_root. (MUST-FIX 2 — real fix.)"""
+    kb_abs = Path(os.path.abspath(kb_root))
+    cur = Path(kb_abs.parts[0])
+    for seg in kb_abs.parts[1:]:
+        cur = cur / seg
+        if cur.is_symlink():
+            raise SystemExit(f"kb: refusing symlinked path component: {cur}")
+    if target_root is not None:
+        tr = os.path.realpath(target_root)
+        kr = os.path.realpath(kb_abs)
+        if kr == tr or kr.startswith(tr + os.sep):
+            raise SystemExit("kb: refusing KB root inside the scanned target tree")
+    if kb_abs.exists():
+        st = kb_abs.lstat()
+        if st.st_uid != os.getuid():
+            raise SystemExit("kb: refusing KB root not owned by current user")
+    for leaf in ("kb.json", "learnings.jsonl", ".kb.lock"):
+        p = kb_abs / leaf
+        if p.is_symlink():
+            raise SystemExit(f"kb: refusing symlinked {leaf}")
+    return kb_abs
+
+
+def _ensure_kb_root(kb, target) -> Path:
+    """assert-safe, create, then re-assert. MUST-FIX 2: the documented order
+    runs `reflect`/`append` before `synthesize`, so a first-use KB whose dir
+    does not exist yet must be created by any writer, not only synthesize."""
+    kb_root = assert_safe_kb_root(Path(kb), Path(target))
+    kb_root.mkdir(parents=True, exist_ok=True)
+    return assert_safe_kb_root(kb_root, Path(target))
+
+
+class _Lock:
+    def __init__(self, kb_root: Path):
+        self.path = Path(kb_root) / ".kb.lock"
+
+    def __enter__(self):
+        import fcntl
+        self.fd = os.open(self.path,
+                          os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        import fcntl
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def _atomic_write_kb(kb_root: Path, data: dict) -> None:
+    real = os.path.realpath(kb_root)
+    if (Path(real) / "kb.json").is_symlink():
+        raise SystemExit("kb: refusing to overwrite symlinked kb.json")
+    fd, tmp = tempfile.mkstemp(dir=real, prefix=".kb.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, os.path.join(real, "kb.json"))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    dfd = os.open(real, os.O_DIRECTORY)          # durability: fsync the dir
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _locked_append(kb_root: Path, lines: list) -> int:
+    """Append JSONL lines to the inbox UNDER THE LOCK (MUST-FIX 3). Both
+    telemetry and steering appends route through here so nothing races the
+    synthesize rotate/clear."""
+    inbox = Path(kb_root) / "learnings.jsonl"
+    written = 0
+    with _Lock(kb_root):
+        fd = os.open(inbox, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            for ln in lines:
+                b = (ln.rstrip("\n") + "\n").encode()
+                if len(b) > MAX_LINE_BYTES:
+                    continue
+                os.write(fd, b); written += 1
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return written
+
+
+# ============================== kb.json load ===================================
+
+def _validate_kb_schema(data) -> dict:
+    """Structurally validate an on-disk kb.json. Refuse (never silently accept)
+    structurally-corrupt data (review §4.9)."""
+    if not isinstance(data, dict):
+        raise SystemExit("kb: kb.json is not an object")
+    typ = {"runs_folded": list, "components": dict, "vuln_classes": dict,
+           "prior_rejections": list, "open_items": list, "telemetry": list}
+    for k, t in typ.items():
+        if k in data and not isinstance(data[k], t):
+            raise SystemExit(f"kb: kb.json field {k!r} has wrong type; refusing")
+    for pr in data.get("prior_rejections", []):
+        if not isinstance(pr, dict) or not isinstance(pr.get("evidence_spans", []), list):
+            raise SystemExit("kb: malformed prior_rejections; refusing")
+        if not isinstance(pr.get("component", ""), str):   # load does `component not in
+            raise SystemExit("kb: malformed prior_rejection component; refusing")  # inv_set` — a list is unhashable
+        for sp in pr.get("evidence_spans", []):
+            if not isinstance(sp, dict):     # _prior_is_stale does sp.get(...) — a
+                raise SystemExit("kb: malformed evidence_span (not an object); refusing")
+    # Nested-value validation: cmd_load does m.get(...) on each component's meta,
+    # so a non-dict value would crash it. Refuse structurally-corrupt nesting
+    # (review helper-bug #7), not just wrong top-level container types.
+    for k in ("components", "vuln_classes"):
+        for name, v in (data.get(k) or {}).items():
+            if not isinstance(v, dict):
+                raise SystemExit(f"kb: malformed {k} entry {name!r}; refusing")
+    for oi in data.get("open_items", []):
+        if not isinstance(oi, dict):
+            raise SystemExit("kb: malformed open_items entry; refusing")
+        if not isinstance(oi.get("component", ""), str):   # same unhashable-in-load guard
+            raise SystemExit("kb: malformed open_item component; refusing")
+    for vc in data.get("vuln_classes", {}).values():
+        if not isinstance(vc.get("watch_components", []), list):
+            raise SystemExit("kb: malformed vuln_classes.watch_components; refusing")
+    return data
+
+
+def _empty_kb() -> dict:
+    return {"schema_version": SCHEMA_VERSION, "identity": {}, "runs_folded": [],
+            "components": {}, "vuln_classes": {}, "prior_rejections": [],
+            "open_items": [], "telemetry": [], "updated": ""}
+
+
+def _load_kb(kb_root: Path) -> dict:
+    p = Path(kb_root) / "kb.json"
+    if not p.is_file():
+        return _empty_kb()
+    try:
+        if p.stat().st_size > MAX_KB_BYTES:
+            raise SystemExit(f"kb: kb.json exceeds {MAX_KB_BYTES} bytes; refusing")
+        data = json.loads(p.read_text())
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"kb: corrupt kb.json ({e}); refusing to proceed")
+    data = _validate_kb_schema(data)
+    for k, v in _empty_kb().items():
+        data.setdefault(k, v)
+    return data
+
+
+def _read_inventory(path: Path) -> list:
+    """Fail CLOSED. The inventory is the completeness-gate denominator, so a
+    silently truncated or filtered list would let `load` treat a real component
+    as absent instead of `uncovered`. Any size/count cap, invalid entry, or read
+    error is a HARD refusal — never a partial list (review MUST-FIX 1)."""
+    try:
+        sz = Path(path).stat().st_size
+    except OSError as e:
+        raise SystemExit(f"kb: cannot stat inventory {path}: {e}")
+    if sz > MAX_INBOX_BYTES:
+        raise SystemExit(f"kb: inventory exceeds {MAX_INBOX_BYTES} bytes; refusing (fail-closed)")
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as e:
+        raise SystemExit(f"kb: cannot read inventory {path}: {e}")
+    comps = []
+    for line in raw.splitlines():
+        try:
+            c = line.decode("utf-8").strip()     # strict: invalid UTF-8 is a refusal,
+        except UnicodeDecodeError:               # not a silent name rewrite
+            raise SystemExit("kb: inventory has invalid UTF-8; refusing (fail-closed)")
+        if not c or c.startswith("#"):
+            continue
+        if ".." in c or c.startswith("/") or len(c) > MAX_COMPONENT_NAME:
+            raise SystemExit(f"kb: invalid inventory entry {c!r}; refusing (fail-closed)")
+        comps.append(c)
+    if len(comps) > MAX_COMPONENTS:
+        raise SystemExit(f"kb: inventory has {len(comps)} components (> {MAX_COMPONENTS}); "
+                         f"refusing (fail-closed)")
+    return comps
+
+
+# ============================ drift (shared) ===================================
+
+def _prior_is_stale(pr: dict, root: Path, identity: dict, now: float) -> bool:
+    """Fail-conservative: stale on ANY divergence or any inability to verify.
+    Aggressive-by-design — 'stale' means MORE rechecking, which is safe under
+    the monotonic-scrutiny invariant. Used by BOTH synthesize AND load."""
+    for sp in pr.get("evidence_spans", []):
+        if _span_digest(root, sp) != sp.get("sha"):
+            return True
+    adj = pr.get("adjudicated_identity", {})
+    if not isinstance(adj, dict):
+        return True
+    for k in ("vcs_commit", "inventory_digest", "build_config_digest",
+              "dependency_digest", "release_label", "dirty_tree_digest"):
+        if adj.get(k) != identity.get(k):
+            return True
+    try:
+        if (now - float(pr.get("synthesized_at", 0))) / 86400.0 > EXPIRY_DAYS:
+            return True
+    except Exception:
+        return True
+    if pr.get("methodology_version") != METHODOLOGY_VERSION:
+        return True
+    return False
+
+
+# ============================ reflect ==========================================
+
+def cmd_reflect(args) -> int:
+    kb_root = _ensure_kb_root(args.kb, args.target)
+    run_dir = Path(args.run_dir)
+    if not run_dir.is_dir():
+        print(f"reflect: not a directory: {run_dir}", file=sys.stderr)
+        return 2
+    files = sorted((run_dir / "trajectories").glob("*/trajectory.json"))
+    lines, n = [], 0
+    for f in files:
+        try:
+            if f.stat().st_size > MAX_TRAJECTORY_BYTES:   # skip oversized (§4.8)
+                print(f"reflect: skip oversized {f}", file=sys.stderr)
+                continue
+            rec = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"reflect: skip {f}: {e}", file=sys.stderr)
+            continue
+        run_id = str(rec.get("run_id", f.parent.name))[:128]
+        model = _cap(rec.get("model_name", ""), 64)
+        term = str(rec.get("terminated_by", ""))
+        err = 0
+        summaries = []
+        for st in rec.get("steps", []):
+            for tr in st.get("tool_results", []):
+                if tr.get("is_error"):
+                    err += 1
+                    lines.append(json.dumps({"kind": "telemetry", "run_id": run_id,
+                        "source_stage": model, "insight_type": "tool_error",
+                        "display_only": True,
+                        "detail": _cap(tr.get("content", ""), args.max_chars)}))
+                    n += 1
+            if st.get("role") == "assistant":
+                txt = " ".join(st.get("text_blocks", []))
+                if txt:
+                    summaries.append(txt)
+                    if _GIVEUP.search(txt):
+                        lines.append(json.dumps({"kind": "telemetry", "run_id": run_id,
+                            "source_stage": model, "insight_type": "gave_up",
+                            "display_only": True, "detail": _cap(txt, args.max_chars)}))
+                        n += 1
+            if n >= MAX_RECORDS_PER_RUN:
+                break
+        lines.append(json.dumps({"kind": "run_signal", "run_id": run_id,
+            "source_stage": model, "terminated_by": term, "display_only": True,
+            "iterations": int(rec.get("iterations", 0)),
+            "tool_calls_made": int(rec.get("tool_calls_made", 0)),
+            "tool_error_count": err,
+            "final_summary_display_only": _cap(summaries[-1], args.max_chars) if summaries else ""}))
+        n += 1
+        if n >= MAX_RECORDS_PER_RUN:
+            break
+    if not files:
+        print("reflect: no trajectories", file=sys.stderr)
+    w = _locked_append(kb_root, lines) if lines else 0
+    print(f"reflect: appended {w} display-only telemetry records", file=sys.stderr)
+    return 0
+
+
+# ============================ append / identity ================================
+
+def cmd_append(args) -> int:
+    kb_root = _ensure_kb_root(args.kb, args.target)
+    if args.record:
+        raw = [args.record]
+    elif args.file and args.file != "-":
+        fp = Path(args.file)
+        if fp.stat().st_size > MAX_INBOX_BYTES:
+            raise SystemExit(f"kb: append --file exceeds {MAX_INBOX_BYTES} bytes; refusing")
+        raw = fp.read_text().splitlines()
+    else:
+        buf = sys.stdin.buffer.read(MAX_INBOX_BYTES + 1)     # BYTES, not characters
+        if len(buf) > MAX_INBOX_BYTES:
+            raise SystemExit(f"kb: stdin append exceeds {MAX_INBOX_BYTES} bytes; refusing")
+        raw = buf.decode("utf-8", "replace").splitlines()
+    lines = []
+    for ln in raw:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            json.loads(ln)          # must be valid JSON to enter the inbox
+        except json.JSONDecodeError:
+            continue
+        lines.append(ln)
+    w = _locked_append(kb_root, lines)
+    print(f"append: wrote {w} records", file=sys.stderr)
+    return 0
+
+
+def cmd_identity(args) -> int:
+    print(json.dumps(compute_identity(Path(args.target)), indent=2))
+    return 0
+
+
+# ============================ synthesize =======================================
+
+def _typed_spans(rec: dict, root: Path):
+    typed = []
+    for sp in rec.get("evidence_spans", [])[:MAX_LIST_LEN]:
+        if not isinstance(sp, dict):
+            continue
+        role = sp.get("role", "source")
+        if role not in _ENUM_EVIDENCE_ROLE:
+            continue
+        dig = _span_digest(root, sp)
+        if dig is None:
+            continue
+        typed.append({"role": role, "file": _cap(sp.get("file", ""), 256),
+                      "start_line": int(sp.get("start_line", 1)),
+                      "end_line": int(sp.get("end_line", sp.get("start_line", 1))),
+                      "sha": dig})
+    return typed
+
+
+def _classify_outcome(rec: dict, inv: set, root: Path, identity: dict):
+    """Returns (kind, payload). kind in {'dirty','prior_rejection','open_item',
+    None}. A rejection needs the FULL proof bundle (MUST-FIX 4); incomplete ->
+    open_item, never a prior."""
+    disp = rec.get("disposition")
+    comp = rec.get("component")
+    if disp not in _ENUM_DISPOSITION or comp not in inv:
+        return (None, None)
+    spans = _typed_spans(rec, root)
+    base = {"finding_sig": _cap(rec.get("finding_sig", ""), 128),
+            "disposition": disp, "component": comp,
+            "path": _cap(rec.get("path", ""), 256),
+            "entry_point": _cap(rec.get("entry_point", ""), 256),
+            "sink": _cap(rec.get("sink", ""), 256),
+            "violated_invariant": _cap(rec.get("violated_invariant", "")),
+            "bug_class": _cap(rec.get("bug_class", ""), 64),
+            "delivery_vectors_tested": [_cap(v, 48) for v in
+                rec.get("delivery_vectors_tested", [])[:MAX_LIST_LEN]],
+            "cross_vendor_result": _cap(rec.get("cross_vendor_result", ""), 128),
+            "evidence_spans": spans, "run_id": _cap(rec.get("run_id", ""), 128),
+            "commit": _cap(rec.get("commit", ""), 64)}
+    if disp in ("confirmed", "corrected"):
+        return ("dirty", base)
+    if disp == "needs_live_validation":
+        return ("open_item", {**base, "reason": "needs_live_validation"})
+    # disp == rejected: require the full bundle, else demote to open_item.
+    path_ok = _resolve_under_root(root, rec.get("path", "")) is not None
+    complete = (base["finding_sig"] and path_ok and base["entry_point"]
+                and base["sink"] and base["violated_invariant"]
+                and base["delivery_vectors_tested"] and base["cross_vendor_result"]
+                and len(spans) >= 1)
+    if not complete:
+        return ("open_item", {**base, "reason": "incomplete_rejection_bundle"})
+    return ("prior_rejection", base)
+
+
+def _dedup_key(d: dict) -> str:
+    return "|".join(str(d.get(k, "")) for k in
+                    ("finding_sig", "component", "path", "sink", "violated_invariant"))
+
+
+def _fold_record(rec, kb, inv, root, identity) -> int:
+    """Fold ONE inbox record into `kb` in place; return 1 if it changed durable
+    state, else 0. The caller wraps this in try/except so a malformed record can
+    never wedge the whole fold (MUST-FIX 5). Free text (telemetry / run_signal)
+    never creates steering state. A finding_outcome is folded regardless of its
+    run_id — monotonic, so there is no security need to gate on --run-id (gating
+    discarded crashed-run orphans, v3 helper-bug #5); state-level content dedup
+    makes re-folding a safe no-op."""
+    if not isinstance(rec, dict):
+        return 0
+    kind = rec.get("kind")
+    if kind == "telemetry":
+        kb["telemetry"].append({"run_id": _cap(rec.get("run_id", ""), 128),
+            "insight_type": _cap(rec.get("insight_type", ""), 32),
+            "detail": _cap(rec.get("detail", "")), "display_only": True})
+        return 0
+    if kind != "finding_outcome":
+        return 0                            # run_signal + unknown kinds: no state
+    cls, payload = _classify_outcome(rec, inv, root, identity)
+    if cls == "dirty":
+        c = kb["components"].setdefault(payload["component"], {})
+        c["ever_dirty"] = True              # idempotent flag
+        vc = kb["vuln_classes"].setdefault(payload["bug_class"] or "unknown",
+                                           {"watch_components": []})
+        # str() + setdefault: tolerate a structurally-odd loaded kb.json (missing
+        # key / unhashable element) without crashing the fold.
+        wcs = {str(x) for x in vc.setdefault("watch_components", [])}
+        wcs.add(payload["component"])
+        vc["watch_components"] = sorted(wcs)[:256]
+        return 1
+    if cls == "prior_rejection":
+        payload["kind"] = "prior_rejection"
+        payload["synthesized_at"] = time.time()
+        payload["methodology_version"] = METHODOLOGY_VERSION
+        payload["adjudicated_identity"] = identity
+        kb["prior_rejections"].append(payload)
+        kb["components"].setdefault(payload["component"], {})["has_prior_rejection"] = True
+        return 1
+    if cls == "open_item":
+        kb["open_items"].append(payload)
+        return 1
+    return 0
+
+
+def cmd_synthesize(args) -> int:
+    kb_root = _ensure_kb_root(args.kb, args.target)
+    inv_list = _read_inventory(Path(args.inventory))
+    inv = set(inv_list)
+    root = Path(args.target)
+    identity = compute_identity(root, inv_list)
+    inbox = kb_root / "learnings.jsonl"
+
+    with _Lock(kb_root):
+        kb = _load_kb(kb_root)
+
+        # Gather records from (a) any ORPHAN fold-files left by a crashed prior
+        # synthesize (crash tolerance) AND (b) the current inbox, which we
+        # atomically rename aside so concurrent appends can't be erased
+        # (MUST-FIX 3). Appends landing after the rename go to a fresh inbox and
+        # are folded next time. Idempotency is STATE-LEVEL (below), so re-folding
+        # an orphan or a late record is a safe no-op — never a lost record.
+        fold_files = sorted(kb_root.glob(".fold.*.jsonl"))
+        if inbox.is_file():
+            fold_path = kb_root / f".fold.{os.getpid()}.{int(time.time()*1000)}.jsonl"
+            os.rename(inbox, fold_path)
+            fold_files.append(fold_path)
+        # Read fold-files one at a time, each FULLY. We never leave an unread tail
+        # inside a file we consume — that would starve the tail forever (review v4
+        # NEW-DEFECT 1). The caps only decide whether to START the next file, so
+        # every run makes forward progress (at least the first fold-file is fully
+        # consumed) and no record is ever dropped.
+        # Fold each record INLINE as it streams off disk (bounded memory — never
+        # hold a whole fold-file in RAM; review v4 NEW-DEFECT 1). Each started
+        # fold-file is still read to EOF (no tail loss); the caps only decide
+        # whether to START the next file, so every run makes forward progress.
+        applied, nrecs, total, consumed, capped = 0, 0, 0, [], False
+        for fp in fold_files:
+            if capped:
+                break
+            try:
+                with open(fp, "rb") as fh:
+                    for raw in fh:
+                        total += len(raw)
+                        if len(raw) > MAX_LINE_BYTES:
+                            continue
+                        ln = raw.decode("utf-8", "replace").strip()
+                        if not ln:
+                            continue
+                        try:
+                            rec = json.loads(ln)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            applied += _fold_record(rec, kb, inv, root, identity)
+                        except Exception as e:
+                            print(f"synthesize: skip malformed record: {e}", file=sys.stderr)
+                        nrecs += 1
+            except OSError:
+                continue
+            consumed.append(fp)          # fully read -> safe to unlink after write
+            if total > MAX_INBOX_BYTES or nrecs >= MAX_RECORDS_PER_RUN:
+                capped = True            # stop STARTING new files (this one is done)
+        if capped:
+            print("synthesize: cap reached after fully consuming a fold-file; "
+                  "remaining fold-files deferred to the next run (no records dropped)",
+                  file=sys.stderr)
+
+        # STATE-LEVEL idempotency (review §4.12): dedup by content key so
+        # re-folding the same run's records — from an orphan, a late append, or
+        # a re-run — is a no-op, WITHOUT a "skip whole run" gate that could both
+        # lose late records and skip a corrected record forever.
+        def _dedup(items, keyfn, cap):
+            seen, out = set(), []
+            for it in items:
+                k = keyfn(it)
+                if k in seen:
+                    continue
+                seen.add(k); out.append(it)
+            return out[-cap:]
+        kb["prior_rejections"] = _dedup(kb["prior_rejections"], _dedup_key, MAX_PRIOR_REJECTIONS)
+        kb["open_items"] = _dedup(
+            kb["open_items"],
+            lambda o: _dedup_key(o) + "|" + str(o.get("reason", "")),
+            MAX_OPEN_ITEMS)
+        kb["telemetry"] = kb["telemetry"][-MAX_TELEMETRY:]
+        if len(kb["components"]) > MAX_COMPONENTS:
+            kb["components"] = dict(list(kb["components"].items())[-MAX_COMPONENTS:])
+        if len(kb["vuln_classes"]) > MAX_VULN_CLASSES:
+            kb["vuln_classes"] = dict(list(kb["vuln_classes"].items())[-MAX_VULN_CLASSES:])
+
+        # mark removed components stale (review §4.11); drop nothing silently
+        for name, meta in kb["components"].items():
+            if name not in inv:
+                meta["removed"] = True
+            else:
+                meta.pop("removed", None)
+
+        # drift-decay (also recomputed at load — this is a convenience refresh)
+        now = time.time()
+        for pr in kb["prior_rejections"]:
+            pr["drift_status"] = "stale" if _prior_is_stale(pr, root, identity, now) else "fresh"
+
+        kb["identity"] = identity
+        kb["schema_version"] = SCHEMA_VERSION
+        kb["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # runs_folded is an informational audit list only — NOT a skip gate
+        # (idempotency is state-level above). Bounded; deduped.
+        rf = kb.get("runs_folded", [])
+        if args.run_id not in rf:
+            rf.append(args.run_id)
+        kb["runs_folded"] = rf[-MAX_RUNS_FOLDED:]
+
+        # Durable write FIRST, then unlink EXACTLY the fold-files we consumed
+        # (their records are now durable in kb.json). A crash before this leaves
+        # the fold-files for the next synthesize to re-ingest.
+        _atomic_write_kb(kb_root, kb)
+        for fp in consumed:            # only fully-read folds; deferred ones stay
+            try:
+                os.unlink(fp)
+            except OSError:
+                pass
+
+    print(f"synthesize: applied {applied} transitions; "
+          f"{len(kb['prior_rejections'])} priors, {len(kb['open_items'])} open_items",
+          file=sys.stderr)
+    return 0
+
+
+# ============================ load =============================================
+
+def cmd_load(args) -> int:
+    kb_root = assert_safe_kb_root(Path(args.kb), Path(args.target))
+    inv_list = _read_inventory(Path(args.inventory))
+    root = Path(args.target)
+    identity = compute_identity(root, inv_list)
+    kb = _load_kb(kb_root) if (kb_root / "kb.json").is_file() else _empty_kb()
+    comp_meta = kb.get("components", {})
+    now = time.time()
+
+    # priority: confirmed-dirty first, then prior-rejection recheck, else normal.
+    # NOTHING is deprioritized; every current_state is 'uncovered'. Monotonic.
+    def score(comp: str):
+        m = comp_meta.get(comp, {})
+        return (0 if m.get("ever_dirty") else 1,
+                0 if m.get("has_prior_rejection") else 1, comp)
+
+    priority = []
+    for comp in sorted(inv_list, key=score):
+        m = comp_meta.get(comp, {})
+        why = []
+        if m.get("ever_dirty"):
+            why.append("confirmed_dirty(hunt_first)")
+        if m.get("has_prior_rejection"):
+            why.append("prior_rejection(recheck)")
+        priority.append({"component": comp, "current_state": "uncovered",
+                         "priority": "high" if (m.get("ever_dirty") or
+                             m.get("has_prior_rejection")) else "normal",
+                         "why": "; ".join(why) or "no prior signal"})
+
+    # RECOMPUTE drift at load, fail-conservative (MUST-FIX 5). Never trust the
+    # stored drift_status.
+    annotations = []
+    inv_set = set(inv_list)
+    for pr in kb.get("prior_rejections", []):
+        if pr.get("component") not in inv_set:
+            continue
+        stale = _prior_is_stale(pr, root, identity, now)
+        recheck = ("code/identity changed since rejection — treat as FULLY OPEN, "
+                   "recheck from scratch" if stale else
+                   f"previously rejected: {str(pr.get('violated_invariant',''))[:120]} — "
+                   "recheck this AND every delivery vector "
+                   "(path/query/body/cookie/header/enc)")
+        annotations.append({"component": pr.get("component"),
+            "path": pr.get("path", ""), "kind": "prior_rejection",
+            "drift_status": "stale" if stale else "fresh",
+            "finding_sig": pr.get("finding_sig", ""),
+            "delivery_vectors_previously_tested": pr.get("delivery_vectors_tested", []),
+            "recheck": recheck,
+            "ADVISORY_ONLY": "NEVER exclude this candidate; it must reach a "
+                             "fresh from-raw judge + live verifier"})
+    for oi in kb.get("open_items", []):
+        if oi.get("component") in inv_set:
+            annotations.append({"component": oi.get("component"),
+                "kind": "open_item", "reason": oi.get("reason", ""),
+                "recheck": "OPEN — re-drive to resolution this run",
+                "ADVISORY_ONLY": "raises scrutiny only; never excludes"})
+
+    payload = {
+        "PLANNER_CONTEXT_ONLY": ("scheduling + annotation ONLY; MUST NOT be fed "
+            "to generator/judge/verifier contexts"),
+        "MONOTONIC_SCRUTINY": ("every signal only RAISES effort; the KB stores no "
+            "coverage and no safe-signal and can never lower scrutiny or exclude "
+            "a candidate. Current-run coverage is computed fresh from TRIED.md."),
+        "target_identity": identity, "current_inventory_count": len(inv_list),
+        "priority_order": priority, "annotations": annotations,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+# ================================ main =========================================
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="raptor-loop-kb", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("identity"); p.add_argument("--target", required=True)
+    p.set_defaults(func=cmd_identity)
+
+    p = sub.add_parser("append")
+    p.add_argument("--kb", required=True); p.add_argument("--target", required=True)
+    p.add_argument("--record"); p.add_argument("--file")
+    p.set_defaults(func=cmd_append)
+
+    p = sub.add_parser("reflect"); p.add_argument("run_dir")
+    p.add_argument("--kb", required=True); p.add_argument("--target", required=True)
+    p.add_argument("--max-chars", type=int, default=MAX_FIELD_CHARS, dest="max_chars")
+    p.set_defaults(func=cmd_reflect)
+
+    p = sub.add_parser("synthesize")
+    p.add_argument("--kb", required=True); p.add_argument("--target", required=True)
+    p.add_argument("--inventory", required=True)
+    p.add_argument("--run-id", required=True, dest="run_id")
+    p.set_defaults(func=cmd_synthesize)
+
+    p = sub.add_parser("load")
+    p.add_argument("--kb", required=True); p.add_argument("--target", required=True)
+    p.add_argument("--inventory", required=True)
+    p.set_defaults(func=cmd_load)
+
+    args = ap.parse_args(argv)
+    if getattr(args, "max_chars", None) is not None and args.max_chars <= 0:
+        print("bad --max-chars", file=sys.stderr); return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

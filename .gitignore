@@ -1,0 +1,5 @@
+# Editor backups / stale snapshots — not part of the skill
+*.bak
+*.swp
+*~
+.DS_Store
