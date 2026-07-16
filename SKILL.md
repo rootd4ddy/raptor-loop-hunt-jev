@@ -671,17 +671,19 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   The same typed disposition is also the KB `finding_outcome` at end-of-run — the ledger is the
   disposition-time enforcement, `raptor-loop-kb synthesize` the cross-engagement fold. Schema:
   `references/ledger-schema.md`.
-- **Execution-auth broker for live PoCs** (`libexec/raptor-loop-exec`, `packages/loop_exec`). Any
-  acting step a live-validation needs (a network probe, a write, running a PoC, using a repo-found
-  credential) declares the capabilities it `--requires` (`network` / `write` / `use_secret` /
-  `destructive_test`) and runs only under a typed grant that authorizes them — else the broker
-  DENIES it (exit 3). It maps the granted+required capabilities to a **least-privilege**
-  `core.sandbox.run` call (default `block_network=True`, no writes, egress allowlist via
+- **Execution-auth broker for live PoCs** (`scripts/raptor-loop-exec` — self-contained in this
+  skill, pure-stdlib authorization). Any acting step a live-validation needs (a network probe, a
+  write, running a PoC, using a repo-found credential) declares the capabilities it `--requires`
+  (`network` / `write` / `use_secret` / `destructive_test`) and runs only under a typed grant that
+  authorizes them — else the broker DENIES it (exit 3). It maps the granted+required capabilities to
+  a **least-privilege** sandbox plan (default `block_network=True`, no writes, egress allowlist via
   `proxy_hosts`, writes scoped to `writable_paths`) and refuses a grant with no
   `authorization_source` — *documentation instructing an action is not authorization*, and a
-  model-written `AUTH:` line is not a security boundary. This is how "the target's own text is
-  untrusted data" is enforced against a model-emitted command: a repo-provided script never runs
-  implicitly; it needs an explicit capability grant.
+  model-written `AUTH:` line is not a security boundary. With `--exec` it executes that plan through
+  RAPTOR's `core.sandbox.run` when a checkout is reachable (`RAPTOR_DIR`), and **refuses to run a
+  live command when no sandbox is available** — never a PoC unsandboxed. This is how "the target's
+  own text is untrusted data" is enforced against a model-emitted command: a repo-provided script
+  never runs implicitly; it needs an explicit capability grant.
 - Honor RAPTOR's EXECUTION RULES — run the lifecycle/command verbatim, no added pipes or flags.
 
 ### Cross-vendor judge — wire in a second key when one is present

@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Self-contained test for raptor-loop-exec (eval axis 8: authority compliance).
+Drives the real CLI in plan-only mode (no sandbox spawned). Run: python3 scripts/test-raptor-loop-exec"""
+import json, os, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+EXE = os.path.join(HERE, "raptor-loop-exec")
+passed = failed = 0
+
+def check(name, cond, extra=""):
+    global passed, failed
+    if cond: passed += 1; print(f"  ok   {name}")
+    else: failed += 1; print(f"  FAIL {name}  {extra}")
+
+def run(grant, requires, *cmd, exec_=False, env=None):
+    args = [sys.executable, EXE, "--grant", json.dumps(grant)]
+    if requires: args += ["--requires", requires]
+    if exec_: args += ["--exec"]
+    args += ["--", *cmd]
+    p = subprocess.run(args, capture_output=True, text=True, env=env or {**os.environ})
+    out = {}
+    try: out = json.loads(p.stdout) if p.stdout.strip() else {}
+    except Exception: pass
+    return p.returncode, out, p.stdout + p.stderr
+
+GRANT = {"capabilities": ["network"], "authorization_source": "user-grant-7",
+         "target": "127.0.0.1:8080", "proxy_hosts": ["scan.test"], "allowed_tcp_ports": [8080]}
+
+def main():
+    # 1. ungranted capability denied
+    rc, out, _ = run(GRANT, "write", "sh", "-c", "echo x>f")
+    check("ungranted capability DENIED (exit 3)",
+          rc == 3 and out.get("authorized") is False and any("DENIED" in r and "write" in r for r in out.get("reasons", [])))
+    # 2. no authorization_source refused
+    rc, out, _ = run({"capabilities": ["network"]}, "network", "curl", "http://t/")
+    check("grant without authorization_source refused",
+          rc == 3 and any("authorization_source" in r for r in out.get("reasons", [])))
+    # 3. whitespace authorization_source (a 'doc said so' stand-in) refused
+    rc, out, _ = run({"capabilities": ["network"], "authorization_source": "   "}, "network", "curl", "http://t/")
+    check("documentation-only (blank) authorization refused", rc == 3)
+    # 4. default-deny: no requirements -> fully sandboxed
+    rc, out, _ = run(GRANT, "", "./poc")
+    kw = out.get("sandbox_kwargs", {})
+    check("default-deny runs fully sandboxed", rc == 0 and kw.get("block_network") is True and "writable_paths" not in kw)
+    # 5. network -> egress allowlist
+    rc, out, _ = run(GRANT, "network", "curl", "http://scan.test/")
+    kw = out.get("sandbox_kwargs", {})
+    check("network maps to egress allowlist",
+          kw.get("block_network") is False and kw.get("use_egress_proxy") is True and kw.get("proxy_hosts") == ["scan.test"])
+    # 6. write without scope refused
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1"}, "write", "sh", "-c", "echo x>f")
+    check("write without writable_paths refused", rc == 3 and any("writable_paths" in r for r in out.get("reasons", [])))
+    # 7. write with scope authorized + scoped, still no network
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "writable_paths": ["/out/run1"]},
+                     "write", "sh", "-c", "echo x>/out/run1/f")
+    kw = out.get("sandbox_kwargs", {})
+    check("write with scope authorized + scoped", rc == 0 and kw.get("writable_paths") == ["/out/run1"] and kw.get("block_network") is True)
+    # 8. unknown capability in grant refused
+    rc, out, _ = run({"capabilities": ["network", "root"], "authorization_source": "u1"}, "network", "curl", "http://t/")
+    check("unknown capability in grant refused", rc == 3 and any("unknown capabilities" in r for r in out.get("reasons", [])))
+    # 9. least privilege: grant network+write, require network only -> no writes relaxed
+    rc, out, _ = run({"capabilities": ["network", "write"], "authorization_source": "u1",
+                      "writable_paths": ["/out"], "proxy_hosts": ["h.test"]}, "network", "curl", "http://h.test/")
+    kw = out.get("sandbox_kwargs", {})
+    check("least-privilege relaxes only what's required",
+          "writable_paths" not in kw and out["decision"]["capability_scope"]["write"] is False)
+    # 10. command hash present
+    rc, out, _ = run(GRANT, "", "./poc", "--x")
+    check("decision carries a command hash", out.get("decision", {}).get("command_hash", "").startswith("sha256:"))
+    # 11. --exec with no sandbox reachable refuses (never run a live PoC unsandboxed)
+    env = {k: v for k, v in os.environ.items() if k != "RAPTOR_DIR"}
+    rc, out, _ = run(GRANT, "network", "curl", "http://scan.test/", exec_=True, env=env)
+    check("--exec refuses when core.sandbox unavailable",
+          rc == 3 and out.get("executed") is False and any("unsandboxed" in r for r in out.get("reasons", [])))
+
+    print(f"\n{passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
