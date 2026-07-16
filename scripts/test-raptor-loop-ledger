@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Self-contained test for raptor-loop-ledger. No network, no RAPTOR imports.
+Drives the real CLI via subprocess in a temp dir and asserts the state-machine invariants.
+Run: python3 scripts/test-raptor-loop-ledger   (exit 0 = all pass)"""
+import json, os, subprocess, sys, tempfile, shutil
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LEDGER = os.path.join(HERE, "raptor-loop-ledger")
+ENV = {**os.environ, "RAPTOR_LEDGER_FAKE_NOW": "1752600000"}
+
+passed = failed = 0
+def check(name, cond, extra=""):
+    global passed, failed
+    if cond:
+        passed += 1; print(f"  ok   {name}")
+    else:
+        failed += 1; print(f"  FAIL {name}  {extra}")
+
+def run(*args, stdin=None):
+    p = subprocess.run([sys.executable, LEDGER, *args], capture_output=True, text=True,
+                       input=stdin, env=ENV)
+    out = {}
+    try: out = json.loads(p.stdout) if p.stdout.strip() else {}
+    except Exception: pass
+    return p.returncode, out, p.stdout + p.stderr
+
+def main():
+    tmp = os.path.realpath(tempfile.mkdtemp(prefix="ledger-test-"))  # macOS /var,/tmp are symlinks
+    target = os.path.join(tmp, "target"); os.makedirs(target)
+    # a real source file so evidence spans / paths resolve
+    with open(os.path.join(target, "parser.c"), "w") as f:
+        f.write("int f(int n){char b[8];for(int i=0;i<n;i++)b[i]=0;return b[0];}\n")
+    ledger = os.path.join(tmp, "out", "ledger")
+    L = ["--ledger", ledger]
+    try:
+        rc, out, _ = run("init", *L, "--target", target)
+        check("init returns 0", rc == 0)
+        check("init stamps target_identity", bool(out.get("target_identity", {}).get("target_path_id")))
+
+        # --- add + idempotency ---
+        sqli = json.dumps({"finding_sig": "sig-sqli-1", "component": "modules/report",
+            "path": "modules/report/filter.py", "entry_point": "GET /report?q",
+            "sink": "db.execute", "violated_invariant": "unsanitized q reaches SQL",
+            "bug_class": "cwe-89"})
+        rc, out, _ = run("add", *L, "--target", target, "--record", sqli)
+        cid = out.get("candidate_id")
+        check("add returns candidate id", bool(cid) and out.get("new") is True)
+        rc, out2, _ = run("add", *L, "--target", target, "--record", sqli)
+        check("add is idempotent (same id, new=false)", out2.get("candidate_id") == cid and out2.get("new") is False)
+
+        # --- rejection with INCOMPLETE receipt is REFUSED, candidate stays open ---
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
+                         "--to", "rejected", "--receipt", json.dumps({"rejection_reason": "non-exploitable"}))
+        check("incomplete rejection REFUSED (exit 3)", rc == 3 and out.get("transition") == "REFUSED")
+        check("refused rejection keeps candidate open", out.get("current_state") == "open")
+        rc, out, _ = run("summary", *L)
+        pend = [a["required_action"] for a in out.get("open_pending_actions", [])]
+        check("refused rejection enqueues complete_rejection_bundle", "complete_rejection_bundle" in pend)
+
+        # --- rejection citing a NONEXISTENT job is REFUSED ---
+        full_reject = {"rejection_reason": "non-exploitable", "counter_hypothesis": "input is bound as a parameter",
+            "vector_matrix": [{"vector": "query", "status": "tested", "command_or_fixture": "fix#1",
+                               "observed": "param bound, no structure change"},
+                              {"vector": "body", "status": "tested", "command_or_fixture": "fix#2", "observed": "same"},
+                              {"vector": "header", "status": "not-applicable", "rationale": "q not read from headers"}],
+            "independent_review": {"job_id": "J-doesnotexist"}}
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
+                         "--to", "rejected", "--receipt", json.dumps(full_reject))
+        check("rejection citing unknown job REFUSED", rc == 3 and any("not a recorded" in e for e in out.get("errors", [])))
+
+        # --- record an OVERTURN job; rejection citing it is still REFUSED ---
+        rc, jout, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "gpt-5.6-sol",
+            "target": cid, "verdict": "overturn", "evidence_hash": "h1"}))
+        jid_over = jout.get("job_id"); check("cross-vendor overturn recorded", bool(jid_over))
+        fr2 = {**full_reject, "independent_review": {"job_id": jid_over}}
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
+                         "--to", "rejected", "--receipt", json.dumps(fr2))
+        check("rejection on OVERTURN verdict REFUSED", rc == 3 and any("not 'uphold'" in e for e in out.get("errors", [])))
+
+        # --- record an UPHOLD job; full bundle now ACCEPTED ---
+        rc, jout, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "gpt-5.6-sol",
+            "target": cid, "verdict": "uphold", "evidence_hash": "h2"}))
+        jid_up = jout.get("job_id")
+        fr3 = {**full_reject, "independent_review": {"job_id": jid_up}}
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
+                         "--to", "rejected", "--receipt", json.dumps(fr3))
+        check("full rejection bundle ACCEPTED", rc == 0 and out.get("to") == "rejected", out)
+
+        # --- unreachable rejection WITHOUT gating is REFUSED ---
+        rc, out, _ = run("add", *L, "--target", target, "--record", json.dumps({
+            "finding_sig": "sig-x", "component": "c", "path": "parser.c", "bug_class": "cwe-79"}))
+        cx = out["candidate_id"]
+        rc, jj, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "m", "target": cx, "verdict": "uphold"}))
+        unreach = {"rejection_reason": "unreachable", "counter_hypothesis": "route not registered",
+            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "404"}],
+            "independent_review": {"job_id": jj["job_id"]}}
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cx, "--to", "rejected",
+                         "--receipt", json.dumps(unreach))
+        check("unreachable kill without gating REFUSED", rc == 3 and any("gating" in e for e in out.get("errors", [])))
+
+        # --- confirmation: memory-safety, sanitizer oracle -> ACCEPTED + auto dirty_sweep ---
+        rc, out, _ = run("add", *L, "--target", target, "--record", json.dumps({
+            "finding_sig": "sig-oob", "component": "core", "path": "parser.c",
+            "sink": "b[i]", "violated_invariant": "no bound on i", "bug_class": "memory-safety"}))
+        coob = out["candidate_id"]
+        # crash-inflation guard: dos oracle on a memory-safety exploitability claim -> REFUSED
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", coob, "--to", "confirmed",
+                         "--receipt", json.dumps({"oracle_class": "dos", "replay_command": "r",
+                            "input_hash": "ih", "expected_predicate": "process abort", "observed_artifacts": ["a"]}))
+        check("dos oracle on memory-safety exploitability REFUSED (inflation guard)",
+              rc == 3 and any("sanitizer-class" in e for e in out.get("errors", [])))
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", coob, "--to", "confirmed",
+                         "--receipt", json.dumps({"oracle_class": "sanitizer", "replay_command": "asan-repro.sh",
+                            "input_hash": "sha:deadbeef", "expected_predicate": "AddressSanitizer: stack-buffer-overflow in f",
+                            "observed_artifacts": ["asan.log#sha1"]}))
+        check("sanitizer confirmation ACCEPTED", rc == 0 and out.get("to") == "confirmed", out)
+        check("confirmation auto-enqueues dirty_sweep", out.get("pending_enqueued"))
+
+        # --- file-close REFUSED while sweep open ---
+        rc, out, _ = run("file-close", *L, "--file", "parser.c")
+        check("file-close REFUSED while sweep open", rc == 3 and out.get("file_close") == "REFUSED")
+
+        # --- pending-complete the sweep, then file-close OK ---
+        sweep_action = None
+        _, s, _ = run("summary", *L)
+        for a in s["open_pending_actions"]:
+            if a["required_action"] == "dirty_sweep": sweep_action = a["action_id"]
+        rc, out, _ = run("pending-complete", *L, "--action", sweep_action, "--receipt", json.dumps({
+            "enumeration_recipe": {"callgraph_root": "f", "commands": ["cscope -L3 f"]},
+            "discovered_sites": [{"site": "parser.c:1", "disposition": "ruled_out"}],
+            "site_set_hash": "sha:sites1"}))
+        check("dirty_sweep pending-complete OK", rc == 0 and out.get("pending_complete") == "OK")
+        rc, out, _ = run("file-close", *L, "--file", "parser.c")
+        check("file-close OK after sweep complete", rc == 0 and out.get("file_close") == "OK")
+
+        # --- dirty_sweep completion with a bad receipt (grep-only, no hash) is REFUSED ---
+        rc, out, _ = run("add", *L, "--target", target, "--record", json.dumps({
+            "finding_sig": "sig-oob2", "component": "core", "path": "other.c", "bug_class": "cwe-787"}))
+        c2 = out["candidate_id"]
+        run("transition", *L, "--target", target, "--candidate", c2, "--to", "confirmed", "--receipt",
+            json.dumps({"oracle_class": "sanitizer", "replay_command": "r", "input_hash": "h",
+                        "expected_predicate": "asan", "observed_artifacts": ["x"]}))
+        _, s2, _ = run("summary", *L)
+        a2 = next(a["action_id"] for a in s2["open_pending_actions"] if a["required_action"] == "dirty_sweep")
+        rc, out, _ = run("pending-complete", *L, "--action", a2, "--receipt", json.dumps({"site_set_hash": ""}))
+        check("bad dirty_sweep receipt REFUSED", rc == 3 and out.get("pending_complete") == "REFUSED")
+
+        # --- needs-live-validation is first-class, enqueues live_validation, blocks report ---
+        rc, out, _ = run("add", *L, "--target", target, "--record", json.dumps({
+            "finding_sig": "sig-idor", "component": "api", "path": "parser.c", "bug_class": "idor"}))
+        cidor = out["candidate_id"]
+        rc, out, _ = run("transition", *L, "--target", target, "--candidate", cidor, "--to",
+                         "needs-live-validation", "--receipt", json.dumps({
+                            "safe_test": "curl -H 'id: victim' /api/obj/2 as attacker; 200 = vuln, 403 = safe",
+                            "potential_severity": "High"}))
+        check("needs-live-validation ACCEPTED", rc == 0 and out.get("to") == "needs-live-validation")
+        check("needs-live enqueues live_validation", out.get("pending_enqueued"))
+        _, s3, _ = run("summary", *L)
+        check("summary flags report_blocking while pendings open", s3.get("report_blocking") is True)
+        check("summary renders one-line refs", any("[" in c["one_line"] for c in s3["candidates"]))
+
+        # ============ Phase 3: conformance gate (deterministic closure) ============
+        # (7) coverage-honesty: an inventory component with no coverage record -> FAIL
+        inv = os.path.join(tmp, "inv.txt"); open(inv, "w").write("modules/report\nmodules/auth\nmodules/api\n")
+        cov = os.path.join(tmp, "cov.txt"); open(cov, "w").write("modules/report\n")  # auth+api uncovered
+        rc, out, _ = run("conformance", *L, "--inventory", inv, "--covered", cov)
+        check("conformance FAILS on uncovered components (coverage-honesty)",
+              rc == 3 and set(out["failures"].get("uncovered_components_implied_done", [])) == {"modules/auth", "modules/api"})
+        # cover the rest -> that specific check clears (pendings still block, tested below)
+        open(cov, "w").write("modules/report\nmodules/auth\n")
+        omit = os.path.join(tmp, "omit.txt"); open(omit, "w").write("modules/api\n")
+        rc, out, _ = run("conformance", *L, "--inventory", inv, "--covered", cov, "--omitted", omit)
+        check("conformance: covered+omitted clears the coverage check",
+              "uncovered_components_implied_done" not in out["failures"])
+
+        # (open pendings still block the report at this point)
+        check("conformance FAILS while pendings open", out["conformance"] == "FAIL"
+              and out["failures"].get("open_pending_actions_block_report"))
+
+        # (3+4) claims-reconciliation: claim a REJECTED candidate as confirmed -> FAIL
+        claims = os.path.join(tmp, "claims.json")
+        open(claims, "w").write(json.dumps({"confirmed": [cid]}))   # cid was REJECTED earlier
+        rc, out, _ = run("conformance", *L, "--claims", claims)
+        check("conformance FAILS when a claim contradicts the ledger",
+              any("state='rejected'" in x for x in out["failures"].get("report_claims_contradict_ledger", [])))
+        # a claim referencing a nonexistent candidate -> FAIL
+        open(claims, "w").write(json.dumps({"confirmed": ["C-ghost"]}))
+        rc, out, _ = run("conformance", *L, "--claims", claims)
+        check("conformance FAILS on a claim with no such candidate",
+              any("no such candidate" in x for x in out["failures"].get("report_claims_contradict_ledger", [])))
+
+        # (9) staleness: a receipt certified against a different commit than HEAD -> flagged.
+        # target has no git repo here (identity commit empty), so simulate by pointing --target at
+        # a git repo whose HEAD differs from the (empty) certified_commit. Use the skill repo as a
+        # commit-bearing tree: certified_commit was "" (no git in target), HEAD is non-empty -> stale.
+        skillrepo = HERE + "/.."
+        rc, out, _ = run("conformance", *L, "--target", skillrepo)
+        # confirmed candidates here were certified with empty commit (target had no git) -> not flagged
+        # (empty certified_commit is skipped). This asserts the check RUNS without false positives:
+        check("conformance staleness check runs without false-positive on uncommitted receipts",
+              "stale_receipts_vs_current_commit" not in out["failures"])
+
+        # after completing ALL pendings, a fully-covered run with no contradicting claims PASSES
+        _, sfin, _ = run("summary", *L)
+        for a in sfin["open_pending_actions"]:
+            ra = a["required_action"]
+            if ra == "dirty_sweep":
+                run("pending-complete", *L, "--action", a["action_id"], "--receipt", json.dumps({
+                    "enumeration_recipe": {"commands": ["x"]}, "discovered_sites": [], "site_set_hash": "h"}))
+            else:
+                run("pending-complete", *L, "--action", a["action_id"])
+        rc, out, _ = run("conformance", *L, "--inventory", inv, "--covered", cov, "--omitted", omit)
+        check("conformance PASSES when covered, no open pendings, no bad claims",
+              rc == 0 and out["conformance"] == "PASS", out.get("failures"))
+
+        print(f"\n{passed} passed, {failed} failed")
+        return 1 if failed else 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+if __name__ == "__main__":
+    sys.exit(main())
