@@ -43,23 +43,36 @@ ledger** — a refused transition leaves it `open`, never dropped. Full `state_h
   `expected_predicate` (a machine-checkable signal — "looks exploitable" is rejected);
   `observed_artifacts` (≥1). **Crash-inflation guard:** `oracle_class=dos` (a bare crash) cannot
   confirm a memory-safety *exploitability* claim — use a sanitizer-class receipt, or file the DoS
-  impact. A confirmed memory-safety bug auto-enqueues a `dirty_sweep`.
+  impact. A confirmed memory-safety bug auto-enqueues a `dirty_sweep`. **Interpreter-sink guard:** a
+  confirmation of a finding whose `sink` is an interpreter/process (`psql`/shell/`exec`/`spawn`/`eval`/
+  deserializer/`restore`) rated **≥2 levels below** its severe high-water-mark must carry
+  `sink_semantics {invocation_mode, interpreter_grammar, execution_identity}` — so a "confirmed medium"
+  on a `psql` sink cannot ship without the argv/`\!`/execution-identity analysis (the F-22 lesson).
 - **rejected — rejection receipt:** `rejection_reason` ∈ {unreachable, non-exploitable,
   expected-behavior, duplicate, out-of-scope}; a `counter_hypothesis`; a `vector_matrix` where each
   row is `{vector, status}` and `tested` → `command_or_fixture` + `observed`, `not-applicable` →
   `rationale` (a bare list proves nothing; `enc` is a transform dimension, not a vector); for
   `unreachable`, a `gating` block (`build_digest`, `config_digest`, `route_or_symbol_evidence`); and
   `independent_review.job_id` referencing a **recorded** cross-vendor job whose `verdict` is
-  `uphold` (an overturn / inconclusive / unknown job REFUSES the kill).
+  `uphold` (an overturn / inconclusive / unknown job REFUSES the kill). **Invariant guard:** a kill
+  that relies on an invariant (`basis="invariant"`, or a `counter_hypothesis` asserting "always
+  single-owner / can only / by construction") requires `invariant_challenge {invariant,
+  enforcement_site, all_writers[], mutation_paths[], counterexample_tested}` — a construction path is
+  not proof; enumerate EVERY writer incl. bulk/import/restore/deser (the F-07 miss: `PUT /assets
+  {duplicateId}` was an unlisted writer). **Intended-behavior guard:** `rejection_reason=expected-behavior`
+  requires `policy_evidence {artifact, span_or_url}` citing a spec/doc/config that sanctions it — "a
+  sibling endpoint does it" is a second bug, not intent (F-18).
 - **needs-live-validation — validation receipt:** `safe_test` (exact request/command + expected
   vulnerable-vs-safe response) and `potential_severity`. First-class, not a soft reject;
   auto-enqueues a `live_validation`.
 - **material downgrade — `material_downgrade_receipt`:** a *severity* downgrade of a severe finding is
   a partial rejection and carries the rejection burden. It is **DERIVED, never a caller-selected
-  label**: fires when the candidate's append-only `potential_hwm` ∈ {high, critical} AND the target is
-  an effective-final Low/hardening (`corrected` with `effective_severity ≤ low`, or
-  `duplicate`/`out-of-scope` without a `canonical_finding` that preserves it). The high-water-mark is
-  retained, so `High→Medium→Low` still trips. `rejected` (own gate), `confirmed` (oracle-gated), and
+  label**: fires when the candidate's append-only `potential_hwm` ∈ {high, critical} AND the target is a
+  **≥2-level severity drop** (`corrected` with `effective_severity` ≥2 ranks below the hwm — so
+  `Critical→Medium` and `*→Low` trip but `Critical→High`/`High→Medium` do not; the F-22 restore-RCE was
+  capped `Critical→Medium`, which an "effective-Low only" rule missed) or `duplicate`/`out-of-scope`
+  without a `canonical_finding` that preserves it. The high-water-mark is retained, so `High→Medium→Low`
+  still trips. `rejected` (own gate), `confirmed` (oracle-gated), and
   `needs-live`/`open` (kept alive) are exempt. The receipt needs `negated_hypothesis`,
   `consequence_trace`, a bounded `trigger_paths[]` (each `{path_id, status ∈
   tested|static-cleared|needs-live|needs-review, observed|evidence}` — a `needs-live`/`needs-review`
@@ -93,7 +106,7 @@ refused). `file-close --file F` is REFUSED while a `dirty_sweep` for a candidate
 ## CLI
 
 - `init --ledger DIR --target DIR` — create, stamp identity.
-- `add --ledger DIR --target DIR (--record JSON | -)` — register candidate (idempotent by signature).
+- `add --ledger DIR --target DIR (--record JSON | -)` — register candidate (idempotent by signature; refuses a placeholder/stub record — invalid-cell lint).
 - `cross-vendor --ledger DIR (--job JSON | -)` — record a dispatched review job.
 - `transition --ledger DIR --target DIR --candidate C --to STATE (--receipt JSON | -)` — the gate.
 - `pending-complete --ledger DIR --action A (--receipt JSON | -)` — close a pending action.
@@ -108,7 +121,7 @@ refused). `file-close --file F` is REFUSED while a `dirty_sweep` for a candidate
   non-empty. This is the "verify claims, not just re-read your own work" pass — coverage, rejection, and
   downgrade claims are checked, not only `confirmed` ones, because those are the claims that *suppress* work.
 
-Self-test: `python3 scripts/test-raptor-loop-ledger` (44 assertions; no network, no RAPTOR imports).
+Self-test: `python3 scripts/test-raptor-loop-ledger` (52 assertions; no network, no RAPTOR imports).
 Eval battery + fixtures: `eval/README.md` (the 11-axis trap suite; deterministic axes are these tests,
 live-model axes are orchestrator-driven).
 

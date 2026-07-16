@@ -82,10 +82,48 @@ SEVERITY_RANK = {"": 0, "none": 0, "info": 1, "informational": 1, "hardening": 1
 SEVERE_HWM = 3  # HIGH and above is a "severe high-water mark"
 # a target severity at/below this rank is an "effective-Low" landing (a claim-extinguishing floor)
 EFFECTIVE_LOW = 1
+# a material downgrade is a >=2-LEVEL severity drop from a severe high-water mark. This catches
+# Critical->Medium (4-2=2) as well as *->Low, while Critical->High (1) and High->Medium (1) stay
+# ordinary corrections (gpt-5.6-sol amendment: the F-22 restore-RCE was capped Critical->Medium, a
+# 2-level drop an "effective-Low only" rule would miss).
+MIN_MATERIAL_DROP = 2
+# sinks whose SEMANTICS decide impact — a confirmation that under-rates one of these must carry the
+# sink-semantic fields (invocation mode, interpreter grammar/metacommands, execution identity), so a
+# "confirmed medium" on a psql/shell sink cannot ship without the `\!`/argv analysis (F-22 lesson).
+INTERPRETER_SINK_RE = ("psql", "sqlite", "mysql", "/bin/sh", "bash", " sh ", "exec", "spawn", "system(",
+                       "eval", "deseriali", "pickle", "yaml.load", "marshal", "restore", "child_process")
 
 
 def _sev_rank(s) -> int:
     return SEVERITY_RANK.get(str(s or "").strip().lower(), 0)
+
+
+def _material_drop(hwm_rank: int, target_rank: int) -> bool:
+    """A severe (>=HIGH) finding dropping >=2 severity levels to its target rating."""
+    return hwm_rank >= SEVERE_HWM and (hwm_rank - target_rank) >= MIN_MATERIAL_DROP
+
+
+PLACEHOLDER_TOKENS = {"", "test", "tbd", "todo", "placeholder", "xxx", "x", "a", "f", "na", "n/a",
+                      "foo", "bar", "baz", "none", "-", "example", "sample", "dummy"}
+
+
+def _looks_trivial(v) -> bool:
+    """A placeholder-ish token: a known stub word or a <=2-char value carrying no locus."""
+    v = str(v).strip().lower()
+    return v in PLACEHOLDER_TOKENS or len(v) <= 2
+
+
+def _looks_placeholder(rec: dict) -> bool:
+    """A stub/placeholder candidate (all fields literal 'test', evidence file 'a' line 1) is an
+    INVALID cell execution, not valid negative evidence — it must fail, forcing a rerun. This is the
+    B3-style artifact that silently passed as a completed 'dry' cell (gpt-5.6-sol invalid-cell lint).
+    Conservative on false-REJECTION (a short-but-real signature is fine as long as SOME locus is
+    substantive); the real signal is 'no substantive content anywhere'."""
+    sig = str(rec.get("finding_sig", "")).strip().lower()
+    if sig in PLACEHOLDER_TOKENS or not sig:
+        return True
+    # a real candidate names at least one substantive locus (component / path / sink / entry point)
+    return all(_looks_trivial(rec.get(k)) for k in ("component", "path", "sink", "entry_point"))
 
 
 # ============================ shared primitives ================================
@@ -352,6 +390,47 @@ def _validate_rejection(receipt: dict, ledger: dict) -> tuple[bool, list]:
             for f in ("build_digest", "config_digest", "route_or_symbol_evidence"):
                 if not str(g.get(f, "")).strip():
                     errs.append(f"gating.{f} required for an unreachable kill (observed, not asserted)")
+    # INVARIANT kills (gpt-5.6-sol): "X is always single-owner / can only ever be Y" is the F-07/F-20
+    # failure — a construction path is not an invariant. Require the FULL writer inventory + a challenge.
+    ch = str(receipt.get("counter_hypothesis", "")).lower()
+    INV_SIGNAL = ("single-owner", "single owner", "per-owner", "one owner", "sole owner", "uniquely owned",
+                  "at most one", "only one", "owned by the", "always ", "only ever", "guaranteed",
+                  "invariant", "can only", "cannot be", "never ", "by construction", "always scoped")
+    if receipt.get("basis") == "invariant" or any(s in ch for s in INV_SIGNAL):
+        inv = receipt.get("invariant_challenge")
+        if not isinstance(inv, dict):
+            errs.append("this kill relies on an INVARIANT (e.g. 'always single-owner') -> requires an "
+                        "invariant_challenge {invariant, enforcement_site, all_writers[], mutation_paths[], "
+                        "counterexample_tested} — a construction path is NOT proof the invariant holds")
+        else:
+            if not str(inv.get("invariant", "")).strip():
+                errs.append("invariant_challenge.invariant required (state the exact invariant relied on)")
+            if not str(inv.get("enforcement_site", "")).strip():
+                errs.append("invariant_challenge.enforcement_site required (where it is enforced)")
+            aw = inv.get("all_writers")
+            # each writer must be a SUBSTANTIVE locus (file:sym/route), not a placeholder like "x"
+            good_writers = [w for w in aw if isinstance(aw, list) and isinstance(w, str)
+                            and not _looks_trivial(w)]
+            if not isinstance(aw, list) or not good_writers:
+                errs.append("invariant_challenge.all_writers[] required with SUBSTANTIVE entries — enumerate "
+                            "EVERY writer to the invariant-bearing field/relation incl. bulk/import/restore/"
+                            "deser (the F-07 miss: PUT /assets {duplicateId} was an unlisted writer)")
+            if not isinstance(inv.get("mutation_paths"), list):
+                errs.append("invariant_challenge.mutation_paths[] required (the write/import/bulk paths that "
+                            "could violate the invariant)")
+            if not isinstance(inv.get("counterexample_tested"), bool):
+                errs.append("invariant_challenge.counterexample_tested required (bool: did you try to break it)")
+    # INTENDED-BEHAVIOR kills: "a sibling endpoint already exposes it" is NOT product intent. Require a
+    # real policy artifact WITH the sanctioning quote; a contrary privacy control (publicUsers) is evidence
+    # AGAINST, not for (F-18). NB: the ledger enforces the receipt's STRUCTURE — whether the artifact truly
+    # sanctions the behavior is the cross-vendor judge's semantic call, not a string check.
+    if reason == "expected-behavior":
+        pe = receipt.get("policy_evidence")
+        if not isinstance(pe, dict) or not str(pe.get("artifact", "")).strip() \
+                or not str(pe.get("span_or_url", "")).strip() or not str(pe.get("quote", "")).strip():
+            errs.append("rejection_reason=expected-behavior requires policy_evidence {artifact, span_or_url, "
+                        "quote} citing an explicit spec/doc/config whose QUOTE sanctions this — a sibling "
+                        "exposure or 'another endpoint does it' is not intent (it may be a second bug)")
     # cross-vendor: MUST reference a recorded orchestrator-dispatched job that UPHELD the kill.
     ir = receipt.get("independent_review")
     job_id = ir.get("job_id") if isinstance(ir, dict) else None
@@ -411,6 +490,9 @@ def cmd_add(args) -> int:
     rec = _read_json_arg(args.record, args.file)
     if not str(rec.get("finding_sig", "")).strip():
         raise SystemExit("ledger add: record.finding_sig required (stable candidate signature)")
+    if _looks_placeholder(rec):
+        raise SystemExit("ledger add: refusing a placeholder/stub candidate (fields look like 'test'/'a'/"
+                         "empty) — this is an invalid cell execution, not a finding; rerun the cell")
     cid = _candidate_id(rec)
     with _Lock(root):
         led = _load(root)
@@ -557,16 +639,44 @@ def _is_material_downgrade(cand: dict, to: str, receipt: dict, led: dict) -> boo
     VERIFIED preserving canonical link. `rejected` is EXEMPT (its own rejection gate is >= this burden);
     `confirmed` is EXEMPT (oracle-gated positive evidence of the rated impact); `needs-live`/`open`
     keep the finding alive so are NOT downgrades (gpt-5.6-sol threshold)."""
-    if _cand_hwm(cand) < SEVERE_HWM:
+    hwm = _cand_hwm(cand)
+    if hwm < SEVERE_HWM:
         return False
     if to in ("rejected", "confirmed", "needs-live-validation", "open"):
         return False
     if to == "corrected":
-        eff = receipt.get("effective_severity", receipt.get("severity", ""))
-        return _sev_rank(eff) <= EFFECTIVE_LOW
+        eff = _sev_rank(receipt.get("effective_severity", receipt.get("severity", "")))
+        return _material_drop(hwm, eff)   # >=2-level drop (Critical->Medium included)
     if to in ("duplicate", "out-of-scope"):
+        # extinguishing a severe finding drops it to rank 0 (>=2 levels) unless a canonical preserves it
         return not _canonical_preserves(led, receipt, cand.get("candidate_id", ""))
     return False
+
+
+def _interpreter_sink(cand: dict) -> bool:
+    # coerce every locus to str (a non-string field must not raise) and scan all of them, not just sink.
+    # This is a heuristic BACKSTOP — the boundary-scout DANGEROUS-SINK check is the primary classifier;
+    # over-match only asks for sink_semantics (mild), under-match is caught upstream.
+    s = " ".join(str(cand.get(k, "")) for k in ("sink", "finding_sig", "component", "entry_point")).lower()
+    return any(tok in s for tok in INTERPRETER_SINK_RE)
+
+
+def _validate_interpreter_confirmation(receipt: dict, cand: dict) -> tuple[bool, list]:
+    """A confirmation that rates an interpreter/process-sink finding >=2 levels BELOW its severe
+    high-water-mark must prove it opened the sink's semantics — otherwise 'confirmed medium' ships
+    without the argv/`\\!`/execution-identity analysis that turns F-22 restore into root RCE."""
+    hwm = _cand_hwm(cand)
+    conf = _sev_rank(receipt.get("effective_severity", receipt.get("severity", "")))
+    if not (_interpreter_sink(cand) and _material_drop(hwm, conf)):
+        return True, []
+    ss = receipt.get("sink_semantics")
+    if not isinstance(ss, dict):
+        return False, ["confirmation of an interpreter/process sink rated >=2 levels below its "
+                       "High/Critical high-water-mark requires sink_semantics {invocation_mode, "
+                       "interpreter_grammar, execution_identity} — trace the sink before capping severity"]
+    errs = [f"sink_semantics.{k} required" for k in ("invocation_mode", "interpreter_grammar",
+            "execution_identity") if not str(ss.get(k, "")).strip()]
+    return (not errs), errs
 
 
 def _validate_material_downgrade(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
@@ -652,6 +762,10 @@ def cmd_transition(args) -> int:
         # validate the receipt for the target state
         if to in ("confirmed", "corrected"):
             ok, errs = _validate_confirmation(receipt, bug_class)
+            if ok:
+                iok, ierrs = _validate_interpreter_confirmation(receipt, cand)
+                if not iok:
+                    ok, errs = False, ierrs
             kind = "confirmation"
         elif to == "rejected":
             ok, errs = _validate_rejection(receipt, led)
@@ -900,7 +1014,7 @@ def cmd_conformance(args) -> int:
         landed_low = False
         if st == "corrected":
             eff = (rcpts.get("confirmation", {}).get("receipt", {}) or {})
-            landed_low = _sev_rank(eff.get("effective_severity", eff.get("severity", ""))) <= EFFECTIVE_LOW
+            landed_low = _material_drop(_cand_hwm(c), _sev_rank(eff.get("effective_severity", eff.get("severity", ""))))
         elif st in ("duplicate", "out-of-scope"):
             note = (rcpts.get("note", {}).get("receipt", {}) or {})
             landed_low = not _canonical_preserves(led, note, cid)

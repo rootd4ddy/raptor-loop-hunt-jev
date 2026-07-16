@@ -93,6 +93,21 @@ Rules:
 - Re-run the enumeration when the target changes (new clone, new release) — modules get added
   (e.g. a new protocol bridge, an OpenAPI/REST surface) and a stale inventory silently drops them.
 
+**The entrypoint manifest is the coverage SPINE (mechanical, not a hand list).** A component list is
+too coarse — a route can fall *between* hand-picked cell anchors and be silently skipped (the miss:
+`GET /users/:id/calendar-heatmap` was never read because one cell listed six *other* controllers and
+another opened the file at the wrong route). Before scheduling cells, **deterministically** extract
+every externally-reachable entrypoint — controller routes (method, path, class+method decorators,
+*inherited* auth defaults, handler span), framework filesystem routes (e.g. SvelteKit `+page.ts` /
+`+page.server.ts` loads & actions), and statically-enumerable RPC/event handlers — each with a stable
+`entry_id`. A cell may claim coverage of an entrypoint **only** by recording its exact `entry_id` +
+handler span + effective audience/auth + primary callee + the boundary-scout check-ids run; **opening
+one line in a controller does not cover the controller, and a wildcard "all routes covered" receipt is
+forbidden.** Round closure fails when `manifest_entry_ids − covered − approved_exceptions` is non-empty
+— a deterministic diff, not a model "completeness critic" re-reading its own work. Keep hand-picked
+**non-route** anchors (repositories, background workers, parser/process sinks, state transitions) —
+routes are the spine, not the whole skeleton.
+
 ### Deterministic front-load — cheap ground truth before the LLM loop (Round 0)
 
 Deterministic tools are fast, hallucination-free, and refusal-free. Run them **before** the first
@@ -224,6 +239,77 @@ Run N independent reasoners (default N=10) **with full isolation** — each work
 blind to the others' conclusions. This is an ensemble: isolation preserves diversity, which
 *is* the coverage. Drop isolation and they converge on the first finding (groupthink). Use a
 pipeline so generation, judging, and verification stream rather than barrier-block.
+
+## The per-anchor boundary scout + lossless leads (the recall-miss and false-clear fixes)
+
+A cell scoped to ONE headline bug-class lens is structurally blind to a *different* class living at
+the *same* code. This is the dominant real-world recall failure — measured, on a re-hunt that used
+stronger models than the run it was compared against: an SQLi-lens cell read `searchStatistics` and
+missed the cross-tenant **authz** omission there; an XSS-lens cell read the license route and missed
+the **CSRF** state-changing-GET; an authz-*gate* cell proved a shared-link "correctly gated" and never
+looked at the **response mapper** leaking emails; an IDOR cell read `tag.addAssets` and mistook
+`Permission.AssetShare` (owner **OR partner**) for an owner-only gate. Every one of those was *read*
+and still didn't surface. Two mechanisms fix it — neither is "run five full hunts per anchor":
+
+**1. A short, isolated boundary scout after the primary lens.** For each externally-reachable or
+security-sensitive anchor, run ONE extra reasoner that is **blind to the primary generator's verdict
+and coverage prose** (feed it the anchors and the shared cards below, never "authz is soundly
+implemented" — otherwise it rationalizes the same omission). It evaluates only the boundary checks
+that *apply*, emitting a structured observation or a source-backed `N/A` for each:
+- **ENTRY** — the real audience/auth decorator (incl. inherited class defaults); any state-changing
+  GET / page-load / `load()` that a link click triggers (CSRF / forced-action). *(F-17, F-25)*
+- **SUBJECT** — bind the actor to every path/body id, **session id**, and target resource; expand a
+  permission's *semantics*, never trust its *name* (`AssetShare` = owner-or-partner-or-shared-link,
+  resolved to its predicate spans). *(F-20, F-24)*
+- **SECURITY STATE** — visibility (`Locked`/`Hidden`), elevation/PIN, revocation, lease/session
+  renewal, stale memberships. *(F-34, F-02/F-08)*
+- **OUTPUT** — follow the final serializer/mapper graph and enumerate the sensitive fields it emits
+  against **every** route audience (unauth / shared-link / user / partner / admin). *(F-18, F-19)*
+- **DANGEROUS SINK** — for any interpreter/parser/process, resolve the data channel, invocation
+  mode/options, interpreter grammar/metacommands, and execution identity. *(F-22 `psql \!`)*
+Reuse **capability/mapper cards** across cells so this is cheap: one card per `Permission.*` (its real
+predicate + accepted principals), per response mapper (fields × audiences), per visibility/elevation
+check, per process sink (argv/stdin/identity). Cost is ~+20–35% generator work, not 5×.
+
+**2. Leads are lossless — a concrete defect cannot die in prose.** Cell output is *typed*: a
+`hypothesis` (a question — "does statistics have the same visibility bug?") may stay a lead until
+traced, but a **`defect_observation`** — a reachable operation + a *specific* missing/mismatched
+binding, filter, cleanup, elevation, or policy condition, with source spans for both the operation and
+the control/asymmetry — **automatically opens or joins a candidate** and runs the full
+generate→judge→cross-vendor chain. A `defect_observation` may **never** be marked safe / latent /
+intended / defense-in-depth in a `coverage_note`; **coverage notes are non-dispositive** (they carry
+coverage-receipt references, not security verdicts). This is the exact gap behind the three
+false-clears: the HLS `sessionId`-not-bound-to-caller (F-24), the "duplicate groups are always
+single-owner" invariant (F-07), and the "`mapUser` email is intended baseline" dismissal (F-18) were
+all *present in the run's prose* and never became candidates, so no gate ever fired. Two of those are
+now typed rejection receipts the ledger enforces: an **invariant** kill must inventory **every writer**
+to the invariant-bearing field (incl. bulk/import/restore/deser — the F-07 miss was the unlisted `PUT
+/assets {duplicateId}` writer) plus a counterexample attempt; an **intended-behavior** kill must cite a
+real policy artifact — *"another endpoint already exposes it" is a second bug, not intent*, and a
+contrary privacy control (`publicUsers`) is evidence *against*. Dedup observations by root
+span/resource/control so one defect is one candidate, not two chains.
+
+**3. Bounded security-differential cards feed the scout.** Several misses were *near-sibling
+contradictions* a compact mechanical diff puts straight in front of the reasoner: `search()` vs
+`getStatistics()` visibility predicates (F-42), `searchStatistics` omitting `visibility` its siblings
+pass (F-23), bulk `updateAll` cleanup vs the singular `update` (F-02/F-08), a download path lacking the
+elevation its sibling timeline/search paths enforce (F-34). Generate `security_contrast` cards —
+singular-vs-bulk on a resource, sibling query methods differing in owner/visibility/deleted/elevation/
+session/permission predicates, omitted security args at sibling callsites, all writers to an
+invariant field — restricted to the **same resource/operation family** (AST/call-fingerprint + LSP
+references; batch, never top-K truncate), and attach them to the scout. Don't launch a separate full
+generator.
+
+**Discovery is severity-neutral.** "No LOW-padding" is a *reporting* rule, not a *generation* filter:
+a concrete reachable disclosure/control defect enters the candidate pipeline **regardless of tentative
+severity** — severity is assigned *after* evidence. Pre-judging `externalDomain` as "by-design public"
+suppressed a credential-bearing-URL leak (F-33) before it could be evaluated. The concrete-defect
+threshold (not a severity floor) is what controls candidate volume.
+
+**Invalid-cell lint.** A cell whose only output is a placeholder/stub candidate (fields literal
+`"test"`, evidence `file:"a" line 1`, no source spans) is an **invalid execution, not a dry cell** — it
+fails closure and reruns (the ledger's `add` refuses it). A "dry" verdict requires source-backed
+coverage receipts.
 
 ## The attempt ledger (what makes "loop forever" productive)
 
