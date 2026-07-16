@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""raptor-loop-exec — execution-authorization broker for raptor-loop-hunt live PoCs.
+
+Self-contained (ships with the skill; no RAPTOR-repo code required). Turns a TYPED
+capability grant into a least-privilege sandbox plan and DENIES any required capability
+the grant does not authorize. The design principle, from the gpt-5.6-sol cross-model
+review:
+
+    A prose AUTH: line a model writes is not a security boundary. A model-emitted command
+    runs only with the capabilities the orchestrator explicitly granted, through the
+    sandbox — or it does not run.
+
+This is the enforcement half of the skill's "the target's own text is untrusted data"
+guardrail: a live PoC, a network probe, a write, or a repo-found secret is a *capability*
+that must be granted, never something a reasoner authorizes by asking.
+
+Authorization is PURE STDLIB and side-effect-free (so it is fully testable anywhere).
+Actual execution is optional and lazy: with `--exec`, the broker runs the command through
+RAPTOR's `core.sandbox.run` when available (env `RAPTOR_DIR`), and REFUSES to execute a
+live command when no sandbox is reachable (never run a PoC unsandboxed). Default is
+plan-only (authorize + print the sandbox plan).
+
+Usage:
+  raptor-loop-exec --grant '<json>|@file' --requires network,write [--exec] -- <cmd> [args...]
+Exit codes: 0 authorized (plan printed, or executed → command's returncode); 3 DENIED
+(unauthorized capability, malformed/unauthorized grant, or sandbox unavailable for --exec);
+2 usage/data error.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+# The typed capability vocabulary. Each is a *dangerous* thing a live step might need.
+CAPABILITIES = {"network", "write", "use_secret", "destructive_test"}
+
+
+class ExecDenied(Exception):
+    def __init__(self, reasons):
+        self.reasons = reasons
+        super().__init__("; ".join(reasons))
+
+
+def _command_hash(cmd) -> str:
+    return "sha256:" + hashlib.sha256("\x00".join(cmd).encode()).hexdigest()[:16]
+
+
+def plan_execution(cmd, requires, grant):
+    """Authorize ``cmd`` (declaring it ``requires`` these capabilities) against the typed
+    ``grant``. Returns ``(sandbox_kwargs, decision)``; raises ExecDenied otherwise.
+    Side-effect-free."""
+    if not isinstance(cmd, (list, tuple)) or not cmd or not all(isinstance(c, str) for c in cmd):
+        raise ExecDenied(["command must be a non-empty list of strings"])
+    if not isinstance(grant, dict):
+        raise ExecDenied(["grant must be an object"])
+
+    reasons = []
+    # a grant must cite where authorization came from — a README/skill/doc telling the
+    # agent to act is DOCUMENTED, never AUTHORIZED.
+    auth_src = str(grant.get("authorization_source", "")).strip()
+    if not auth_src:
+        reasons.append("grant.authorization_source is required (a grant id or the user's own "
+                       "words); documentation instructing an action is not authorization")
+
+    granted = set(grant.get("capabilities", []) or [])
+    unknown_granted = granted - CAPABILITIES
+    if unknown_granted:
+        reasons.append(f"grant lists unknown capabilities: {sorted(unknown_granted)}")
+    req = set(requires or [])
+    unknown_req = req - CAPABILITIES
+    if unknown_req:
+        reasons.append(f"command declares unknown required capabilities: {sorted(unknown_req)}")
+    ungranted = req - granted
+    if ungranted:
+        reasons.append(f"DENIED: command requires {sorted(ungranted)} that the grant "
+                       f"{sorted(granted)} does not authorize")
+    if "write" in req and not grant.get("writable_paths"):
+        reasons.append("capability 'write' requires grant.writable_paths (writes must be scoped)")
+    if reasons:
+        raise ExecDenied(reasons)
+
+    # authorized -> LEAST-PRIVILEGE sandbox kwargs (relax only what's required AND granted)
+    kw = {"block_network": True, "caller_label": str(grant.get("caller_label", "loop-exec"))}
+    if grant.get("target"):
+        kw["target"] = grant["target"]
+    if grant.get("restrict_reads"):
+        kw["restrict_reads"] = True
+        if grant.get("readable_paths"):
+            kw["readable_paths"] = list(grant["readable_paths"])
+    if "network" in req:
+        kw["block_network"] = False
+        if grant.get("proxy_hosts"):
+            kw["use_egress_proxy"] = True
+            kw["proxy_hosts"] = list(grant["proxy_hosts"])
+        if grant.get("allowed_tcp_ports"):
+            kw["allowed_tcp_ports"] = list(grant["allowed_tcp_ports"])
+    if "write" in req:
+        kw["writable_paths"] = list(grant["writable_paths"])
+
+    decision = {"authorized": True, "command_hash": _command_hash(cmd),
+                "requires": sorted(req), "granted": sorted(granted),
+                "authorization_source": auth_src,
+                "capability_scope": {c: (c in req) for c in sorted(CAPABILITIES)}}
+    return kw, decision
+
+
+def _load_sandbox():
+    """Lazily import RAPTOR's core.sandbox via RAPTOR_DIR. Returns the module or None.
+    The ONLY place a RAPTOR import happens, and only for real execution."""
+    rd = os.environ.get("RAPTOR_DIR")
+    if not rd:
+        return None
+    if rd not in sys.path:
+        sys.path.insert(0, rd)
+    try:
+        import core.sandbox as sandbox  # noqa
+        return sandbox
+    except Exception:
+        return None
+
+
+def _load_grant(arg: str) -> dict:
+    raw = Path(arg[1:]).read_text() if arg.startswith("@") else arg
+    obj = json.loads(raw)
+    if not isinstance(obj, dict):
+        raise ValueError("grant must be a JSON object")
+    return obj
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="raptor-loop-exec", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--grant", required=True, help="EXECUTION_AUTH grant as JSON or @file")
+    ap.add_argument("--requires", default="",
+                    help="comma-separated caps (network,write,use_secret,destructive_test)")
+    ap.add_argument("--exec", action="store_true", dest="do_exec",
+                    help="execute via core.sandbox (needs RAPTOR_DIR); default is plan-only")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after `--`")
+    args = ap.parse_args(argv)
+
+    cmd = args.cmd[1:] if (args.cmd and args.cmd[0] == "--") else args.cmd
+    if not cmd:
+        sys.stderr.write("raptor-loop-exec: no command given (put it after `--`)\n")
+        return 2
+    try:
+        grant = _load_grant(args.grant)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        sys.stderr.write(f"raptor-loop-exec: bad --grant: {e}\n")
+        return 2
+    requires = [c.strip() for c in args.requires.split(",") if c.strip()]
+
+    try:
+        sandbox_kwargs, decision = plan_execution(cmd, requires, grant)
+    except ExecDenied as denied:
+        print(json.dumps({"authorized": False, "reasons": denied.reasons}, indent=2))
+        return 3
+
+    if not args.do_exec:
+        print(json.dumps({"decision": decision, "sandbox_kwargs": sandbox_kwargs,
+                          "executed": False}, indent=2, default=str))
+        return 0
+
+    sandbox = _load_sandbox()
+    if sandbox is None:
+        print(json.dumps({"authorized": True, "executed": False,
+            "reasons": ["--exec requested but core.sandbox is unavailable (set RAPTOR_DIR to a "
+                        "RAPTOR checkout); refusing to run a live command unsandboxed"]}, indent=2))
+        return 3
+    completed = sandbox.run(list(cmd), **sandbox_kwargs)
+    print(json.dumps({"decision": decision, "sandbox_kwargs": sandbox_kwargs, "executed": True,
+                      "returncode": completed.returncode}, indent=2, default=str))
+    return int(completed.returncode or 0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

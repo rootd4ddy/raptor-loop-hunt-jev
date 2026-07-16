@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""raptor-loop-ledger — engagement-scoped candidate state machine + evidence receipts.
+
+The companion to `raptor-loop-kb`. Where the KB is the *cross-engagement* monotonic-
+scrutiny memory, this ledger is the *within-engagement* enforcement layer that turns a
+disposition from a sentence a reasoner emits into a **state transition the orchestrator
+refuses until an evidence receipt exists** (raptor-loop-hunt SKILL.md, "Disposition
+receipts"). The design principle, from the gpt-5.6-sol cross-model review:
+
+    Models may PROPOSE claims and actions. Only the orchestrator and the execution
+    harness may CERTIFY completion. A field a model could fabricate — the cross-vendor
+    verdict, the oracle result — is populated from an ACTUAL recorded job, never from
+    the reasoner's own text.
+
+Storage is a run-dir sidecar (`<OUTPUT_DIR>/ledger/`), engagement-scoped like TRIED.md —
+NOT the KB. It carries no cross-engagement state and never suppresses a candidate; it only
+refuses a *transition* whose receipt is incomplete, leaving the candidate open.
+
+Subcommands (all writers lock + atomic-write + fsync):
+  init        --ledger DIR --target DIR
+  add         --ledger DIR --target DIR (--record JSON | -)      -> registers a candidate (open)
+  cross-vendor --ledger DIR (--job JSON | -)                     -> records a dispatched review job
+  transition  --ledger DIR --target DIR --candidate C --to STATE (--receipt JSON | -)
+  pending-complete --ledger DIR --action A (--receipt JSON | -)
+  file-close  --ledger DIR --file PATH                           -> refused while a sweep is open
+  summary     --ledger DIR                                       -> report-ready one-line refs + open pendings
+  conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F]
+                                                                 -> deterministic closure gate (set-diffs)
+
+Exit codes: 0 ok; 3 transition/close/conformance REFUSED (receipt incomplete, pending open, or diff nonempty); 2 usage/data error.
+Pure stdlib. No RAPTOR imports, no sys.path manipulation.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+
+# ---- bounds (mirror raptor-loop-kb's fail-closed discipline) ------------------
+MAX_INPUT_BYTES = 1 * 1024 * 1024
+MAX_LEDGER_BYTES = 64 * 1024 * 1024
+MAX_CANDIDATES = 100000
+MAX_PENDING = 100000
+MAX_JOBS = 100000
+MAX_FIELD_CHARS = 500
+MAX_LIST_LEN = 32
+
+# ---- controlled vocabularies (the receipt contract) --------------------------
+STATES_TERMINAL = {"confirmed", "corrected", "rejected", "duplicate", "out-of-scope"}
+STATES_OPEN = {"open", "needs-live-validation"}
+ALL_STATES = STATES_TERMINAL | STATES_OPEN
+
+ORACLE_CLASSES = {
+    "sanitizer", "differential", "authorization", "state-change", "disclosure",
+    "execution", "dos", "timing", "crypto-failure", "parser-differential",
+    "policy-bypass", "race-invariant", "other",
+}
+REJECT_REASONS = {"unreachable", "non-exploitable", "expected-behavior", "duplicate", "out-of-scope"}
+DELIVERY_VECTORS = {"path", "query", "body", "cookie", "header", "enc-request", "cli", "env", "config", "other"}
+VECTOR_STATUS = {"tested", "not-applicable"}
+REVIEW_VERDICTS = {"uphold", "overturn", "inconclusive"}
+PENDING_STATES = {"queued", "completed", "blocked"}
+# bug classes that make a confirmed finding "proven-dirty" -> auto file sweep
+DIRTY_BUG_CLASSES = {"memory-safety", "memory", "cwe-119", "cwe-120", "cwe-122",
+                     "cwe-125", "cwe-787", "cwe-416", "cwe-415", "cwe-190", "cwe-476"}
+
+
+# ============================ shared primitives ================================
+# (reused patterns from raptor-loop-kb: symlink-refusing storage, flock, atomic write)
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _cap(text, n: int = MAX_FIELD_CHARS) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[:max(0, n - 1)] + "…"
+
+
+def _now() -> float:
+    # injectable for deterministic tests
+    ov = os.environ.get("RAPTOR_LEDGER_FAKE_NOW")
+    if ov:
+        try:
+            return float(ov)
+        except ValueError:
+            pass
+    return time.time()
+
+
+def _run_git(target: Path, *args: str) -> str:
+    try:
+        out = subprocess.run(["git", "-C", str(target), *args],
+                             capture_output=True, text=True, timeout=20)
+        return out.stdout if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def assert_safe_ledger_root(ledger_root: Path, target_root) -> Path:
+    """Refuse a symlinked ledger path or one not owned by us. (Mirrors the KB helper's
+    assert_safe_kb_root — the ledger MAY live under the output dir which may be under or
+    beside the target, so we do NOT refuse target-adjacency here; we DO refuse symlinks
+    and foreign ownership.)"""
+    root = Path(os.path.abspath(ledger_root))
+    cur = Path(root.parts[0])
+    for seg in root.parts[1:]:
+        cur = cur / seg
+        if cur.is_symlink():
+            raise SystemExit(f"ledger: refusing symlinked path component: {cur}")
+    if root.exists():
+        st = root.lstat()
+        if st.st_uid != os.getuid():
+            raise SystemExit("ledger: refusing ledger root not owned by current user")
+    for leaf in ("ledger.json", ".ledger.lock"):
+        p = root / leaf
+        if p.is_symlink():
+            raise SystemExit(f"ledger: refusing symlinked {leaf}")
+    return root
+
+
+def _ensure_root(ledger, target) -> Path:
+    root = assert_safe_ledger_root(Path(ledger), Path(target) if target else None)
+    root.mkdir(parents=True, exist_ok=True)
+    return assert_safe_ledger_root(root, Path(target) if target else None)
+
+
+def _resolve_under_root(target_root: Path, rel: str):
+    if not isinstance(rel, str) or not rel:
+        return None
+    base = os.path.realpath(target_root)
+    cand = os.path.realpath(os.path.join(base, rel))
+    if cand == base or cand.startswith(base + os.sep):
+        return Path(cand)
+    return None
+
+
+def _span_digest(target_root: Path, span: dict):
+    if not isinstance(span, dict):
+        return None
+    p = _resolve_under_root(target_root, span.get("file", ""))
+    if p is None or not p.is_file():
+        return None
+    try:
+        lines = p.read_text(errors="replace").splitlines()
+        s = max(1, int(span.get("start_line", 1)))
+        e = int(span.get("end_line", s))
+    except Exception:
+        return None
+    chunk = "\n".join(ln.rstrip() for ln in lines[s - 1:e])
+    return _sha(chunk.encode())[:12]
+
+
+class _Lock:
+    def __init__(self, root: Path):
+        self.path = Path(root) / ".ledger.lock"
+
+    def __enter__(self):
+        import fcntl
+        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        import fcntl
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+def _atomic_write(root: Path, data: dict) -> None:
+    real = os.path.realpath(root)
+    if (Path(real) / "ledger.json").is_symlink():
+        raise SystemExit("ledger: refusing to overwrite symlinked ledger.json")
+    fd, tmp = tempfile.mkstemp(dir=real, prefix=".ledger.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, os.path.join(real, "ledger.json"))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    dfd = os.open(real, os.O_DIRECTORY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _empty_ledger() -> dict:
+    return {"schema_version": SCHEMA_VERSION, "target_identity": {}, "candidates": {},
+            "pending_actions": [], "cross_vendor_jobs": {}, "closed_files": [], "updated": ""}
+
+
+def _load(root: Path) -> dict:
+    p = Path(root) / "ledger.json"
+    if not p.is_file():
+        return _empty_ledger()
+    if p.stat().st_size > MAX_LEDGER_BYTES:
+        raise SystemExit(f"ledger: ledger.json exceeds {MAX_LEDGER_BYTES} bytes; refusing")
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        raise SystemExit(f"ledger: corrupt ledger.json ({e}); refusing")
+    if not isinstance(data, dict):
+        raise SystemExit("ledger: ledger.json is not an object; refusing")
+    for k, v in _empty_ledger().items():
+        data.setdefault(k, v)
+    # minimal structural typing
+    for k, t in (("candidates", dict), ("pending_actions", list),
+                 ("cross_vendor_jobs", dict), ("closed_files", list)):
+        if not isinstance(data[k], t):
+            raise SystemExit(f"ledger: field {k!r} wrong type; refusing")
+    return data
+
+
+def _read_json_arg(record, file_or_dash) -> dict:
+    if record is not None:
+        raw = record
+    elif file_or_dash and file_or_dash != "-":
+        fp = Path(file_or_dash)
+        if fp.stat().st_size > MAX_INPUT_BYTES:
+            raise SystemExit(f"ledger: input exceeds {MAX_INPUT_BYTES} bytes; refusing")
+        raw = fp.read_text()
+    else:
+        buf = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        if len(buf) > MAX_INPUT_BYTES:
+            raise SystemExit(f"ledger: stdin exceeds {MAX_INPUT_BYTES} bytes; refusing")
+        raw = buf.decode("utf-8", "replace")
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"ledger: invalid JSON ({e}); refusing")
+    if not isinstance(obj, dict):
+        raise SystemExit("ledger: JSON record must be an object; refusing")
+    return obj
+
+
+def compute_identity(target: Path) -> dict:
+    real = os.path.realpath(target)
+    return {"target_path_id": _sha(real.encode())[:16],
+            "vcs_commit": _run_git(target, "rev-parse", "HEAD").strip(),
+            "release_label": _run_git(target, "describe", "--tags", "--always").strip()}
+
+
+# ============================ id helpers =======================================
+
+def _candidate_id(rec: dict) -> str:
+    key = "|".join(str(rec.get(k, "")) for k in ("finding_sig", "component", "path"))
+    return "C-" + _sha(key.encode())[:12]
+
+
+def _job_id(job: dict) -> str:
+    key = "|".join(str(job.get(k, "")) for k in
+                   ("model", "target", "verdict", "evidence_hash", "dispatched_at"))
+    return "J-" + _sha(key.encode())[:12]
+
+
+def _receipt_id(candidate_id: str, to_state: str, receipt: dict) -> str:
+    key = candidate_id + "|" + to_state + "|" + json.dumps(receipt, sort_keys=True)[:4000]
+    return "R-" + _sha(key.encode())[:10]
+
+
+def _action_id(target_cid: str, kind: str) -> str:
+    return "A-" + _sha((target_cid + "|" + kind).encode())[:10]
+
+
+# ============================ receipt validators ===============================
+# Each returns (ok: bool, errors: list[str]). The gate: no receipt, no transition.
+
+def _validate_confirmation(receipt: dict, bug_class: str) -> tuple[bool, list]:
+    errs = []
+    oc = receipt.get("oracle_class")
+    if oc not in ORACLE_CLASSES:
+        errs.append(f"oracle_class must be one of {sorted(ORACLE_CLASSES)}; got {oc!r}")
+    if not str(receipt.get("replay_command", "")).strip():
+        errs.append("replay_command required (the script/fixture id that reproduces it)")
+    if not str(receipt.get("input_hash", "")).strip():
+        errs.append("input_hash required (hash of the triggering input)")
+    if not str(receipt.get("expected_predicate", "")).strip():
+        errs.append("expected_predicate required (a machine-checkable signal, not 'looks exploitable')")
+    arts = receipt.get("observed_artifacts")
+    if not isinstance(arts, list) or not arts:
+        errs.append("observed_artifacts must be a non-empty list of artifact hashes/paths")
+    # anti-inflation: a bare crash (dos oracle) cannot certify memory-corruption exploitability
+    bc = (bug_class or "").lower()
+    if oc == "dos" and bc in DIRTY_BUG_CLASSES:
+        errs.append("oracle_class=dos (bare crash) cannot confirm a memory-safety EXPLOITABILITY "
+                    "claim — use a sanitizer-class receipt, or file this as its DoS impact")
+    return (not errs, errs)
+
+
+def _validate_rejection(receipt: dict, ledger: dict) -> tuple[bool, list]:
+    errs = []
+    reason = receipt.get("rejection_reason")
+    if reason not in REJECT_REASONS:
+        errs.append(f"rejection_reason must be one of {sorted(REJECT_REASONS)}; got {reason!r}")
+    if not str(receipt.get("counter_hypothesis", "")).strip():
+        errs.append("counter_hypothesis required (the concrete proposition that kills the finding)")
+    vm = receipt.get("vector_matrix")
+    if not isinstance(vm, list) or not vm:
+        errs.append("vector_matrix must be a non-empty list; a bare vector list proves no test ran")
+    else:
+        for i, row in enumerate(vm[:MAX_LIST_LEN]):
+            if not isinstance(row, dict):
+                errs.append(f"vector_matrix[{i}] must be an object"); continue
+            v = row.get("vector")
+            if v not in DELIVERY_VECTORS:
+                errs.append(f"vector_matrix[{i}].vector must be one of {sorted(DELIVERY_VECTORS)}; got {v!r}")
+            st = row.get("status")
+            if st not in VECTOR_STATUS:
+                errs.append(f"vector_matrix[{i}].status must be one of {sorted(VECTOR_STATUS)}; got {st!r}")
+            elif st == "tested":
+                if not str(row.get("command_or_fixture", "")).strip():
+                    errs.append(f"vector_matrix[{i}] tested -> command_or_fixture required")
+                if not str(row.get("observed", "")).strip():
+                    errs.append(f"vector_matrix[{i}] tested -> observed required (what the test showed)")
+            elif st == "not-applicable":
+                if not str(row.get("rationale", "")).strip():
+                    errs.append(f"vector_matrix[{i}] not-applicable -> rationale required "
+                                "(why this vector cannot reach the sink)")
+    # reachability kills carry build/config gating evidence
+    if reason == "unreachable":
+        g = receipt.get("gating")
+        if not isinstance(g, dict):
+            errs.append("rejection_reason=unreachable requires a gating object "
+                        "(build_digest, config_digest, route_or_symbol_evidence)")
+        else:
+            for f in ("build_digest", "config_digest", "route_or_symbol_evidence"):
+                if not str(g.get(f, "")).strip():
+                    errs.append(f"gating.{f} required for an unreachable kill (observed, not asserted)")
+    # cross-vendor: MUST reference a recorded orchestrator-dispatched job that UPHELD the kill.
+    ir = receipt.get("independent_review")
+    job_id = ir.get("job_id") if isinstance(ir, dict) else None
+    if not job_id:
+        errs.append("independent_review.job_id required — the orchestrator-dispatched cross-vendor "
+                    "review (record it first via `cross-vendor`); a self-written verdict is fraud")
+    else:
+        job = ledger.get("cross_vendor_jobs", {}).get(job_id)
+        if not job:
+            errs.append(f"independent_review.job_id={job_id!r} is not a recorded cross-vendor job "
+                        "(the reasoner cannot invent one — the orchestrator records it via `cross-vendor`)")
+        elif job.get("verdict") != "uphold":
+            errs.append(f"cross-vendor job {job_id} verdict is {job.get('verdict')!r}, not 'uphold' — "
+                        "an overturn/inconclusive review does NOT permit rejection")
+    return (not errs, errs)
+
+
+def _validate_needs_live(receipt: dict) -> tuple[bool, list]:
+    errs = []
+    if not str(receipt.get("safe_test", "")).strip():
+        errs.append("safe_test required (the exact request/command + expected vulnerable-vs-safe response)")
+    if not str(receipt.get("potential_severity", "")).strip():
+        errs.append("potential_severity required (worst case if the unseen layer is insecure)")
+    return (not errs, errs)
+
+
+def _validate_dirty_sweep(receipt: dict) -> tuple[bool, list]:
+    errs = []
+    er = receipt.get("enumeration_recipe")
+    if not isinstance(er, dict) or not (er.get("commands") or er.get("semantic_queries") or er.get("callgraph_root")):
+        errs.append("enumeration_recipe required (commands / semantic_queries / callgraph_root) — "
+                    "the re-runnable derivation of the candidate sibling set")
+    ds = receipt.get("discovered_sites")
+    if not isinstance(ds, list):
+        errs.append("discovered_sites must be a list (each: site + disposition); empty is allowed but must be explicit")
+    if not str(receipt.get("site_set_hash", "")).strip():
+        errs.append("site_set_hash required (re-runnable digest the judge diffs against)")
+    return (not errs, errs)
+
+
+# ============================ subcommands ======================================
+
+def cmd_init(args) -> int:
+    root = _ensure_root(args.ledger, args.target)
+    with _Lock(root):
+        led = _load(root)
+        if not led.get("target_identity"):
+            led["target_identity"] = compute_identity(Path(args.target))
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"ledger": str(root), "target_identity": led["target_identity"]}, indent=2))
+    return 0
+
+
+def cmd_add(args) -> int:
+    root = _ensure_root(args.ledger, args.target)
+    rec = _read_json_arg(args.record, args.file)
+    if not str(rec.get("finding_sig", "")).strip():
+        raise SystemExit("ledger add: record.finding_sig required (stable candidate signature)")
+    cid = _candidate_id(rec)
+    with _Lock(root):
+        led = _load(root)
+        if len(led["candidates"]) >= MAX_CANDIDATES:
+            raise SystemExit("ledger: candidate cap reached; refusing")
+        existing = led["candidates"].get(cid)
+        if existing is None:
+            led["candidates"][cid] = {
+                "candidate_id": cid,
+                "finding_sig": _cap(rec.get("finding_sig", ""), 128),
+                "component": _cap(rec.get("component", ""), 256),
+                "path": _cap(rec.get("path", ""), 256),
+                "entry_point": _cap(rec.get("entry_point", ""), 256),
+                "sink": _cap(rec.get("sink", ""), 256),
+                "violated_invariant": _cap(rec.get("violated_invariant", "")),
+                "bug_class": _cap(rec.get("bug_class", ""), 64),
+                "created_by": _cap(rec.get("created_by", ""), 128),
+                "created_commit": _cap(rec.get("commit", ""), 64),
+                "state": "open",
+                "state_history": [],
+                "receipts": {},
+            }
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"candidate_id": cid, "state": led["candidates"][cid]["state"],
+                      "new": existing is None}))
+    return 0
+
+
+def cmd_cross_vendor(args) -> int:
+    root = _ensure_root(args.ledger, None)
+    job = _read_json_arg(args.job, args.file)
+    verdict = job.get("verdict")
+    if verdict not in REVIEW_VERDICTS:
+        raise SystemExit(f"ledger cross-vendor: verdict must be one of {sorted(REVIEW_VERDICTS)}; got {verdict!r}")
+    if not str(job.get("model", "")).strip():
+        raise SystemExit("ledger cross-vendor: model required (the reviewing model id)")
+    if not str(job.get("target", "")).strip():
+        raise SystemExit("ledger cross-vendor: target required (candidate_id or finding_sig under review)")
+    job.setdefault("dispatched_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())))
+    jid = _job_id(job)
+    rec = {"job_id": jid, "model": _cap(job.get("model", ""), 64),
+           "target": _cap(job.get("target", ""), 128), "verdict": verdict,
+           "evidence_hash": _cap(job.get("evidence_hash", ""), 128),
+           "dispatched_at": _cap(job.get("dispatched_at", ""), 40),
+           "dispatched_by": _cap(job.get("dispatched_by", "orchestrator"), 64)}
+    with _Lock(root):
+        led = _load(root)
+        if len(led["cross_vendor_jobs"]) >= MAX_JOBS:
+            raise SystemExit("ledger: cross-vendor job cap reached; refusing")
+        led["cross_vendor_jobs"][jid] = rec
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"job_id": jid, "verdict": verdict}))
+    return 0
+
+
+def _enqueue(led: dict, target_cid: str, trigger: str, required_action: str) -> dict:
+    aid = _action_id(target_cid, required_action)
+    for a in led["pending_actions"]:
+        if a.get("action_id") == aid and a.get("state") != "completed":
+            return a  # idempotent: don't double-enqueue an open action
+    action = {"action_id": aid, "trigger": trigger, "target": target_cid,
+              "required_action": required_action, "state": "queued",
+              "completion_receipt": None,
+              "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))}
+    if len(led["pending_actions"]) < MAX_PENDING:
+        led["pending_actions"].append(action)
+    return action
+
+
+def cmd_transition(args) -> int:
+    root = _ensure_root(args.ledger, args.target)
+    to = args.to
+    if to not in ALL_STATES:
+        raise SystemExit(f"ledger transition: --to must be one of {sorted(ALL_STATES)}; got {to!r}")
+    receipt = _read_json_arg(args.receipt, args.file)
+    with _Lock(root):
+        led = _load(root)
+        cand = led["candidates"].get(args.candidate)
+        if cand is None:
+            raise SystemExit(f"ledger transition: unknown candidate {args.candidate!r} (add it first)")
+        bug_class = cand.get("bug_class", "")
+
+        # validate the receipt for the target state
+        if to in ("confirmed", "corrected"):
+            ok, errs = _validate_confirmation(receipt, bug_class)
+            kind = "confirmation"
+        elif to == "rejected":
+            ok, errs = _validate_rejection(receipt, led)
+            kind = "rejection"
+        elif to == "needs-live-validation":
+            ok, errs = _validate_needs_live(receipt)
+            kind = "needs_live"
+        else:  # duplicate / out-of-scope: lightweight, just needs a reason
+            ok = bool(str(receipt.get("reason", "")).strip())
+            errs = [] if ok else ["reason required for duplicate/out-of-scope"]
+            kind = "note"
+
+        if not ok:
+            # REFUSED. Candidate stays where it is. Enqueue the follow-up that closes the gap.
+            if to == "rejected":
+                _enqueue(led, args.candidate, "incomplete_rejection", "complete_rejection_bundle")
+            _atomic_write(root, led)
+            out = {"transition": "REFUSED", "candidate_id": args.candidate,
+                   "requested_state": to, "current_state": cand["state"], "errors": errs}
+            print(json.dumps(out, indent=2))
+            return 3
+
+        # ACCEPTED. Record receipt + transition + auto-enqueue PENDING follow-ups.
+        rid = _receipt_id(args.candidate, to, receipt)
+        certified_commit = _cap(_run_git(Path(args.target), "rev-parse", "HEAD").strip(), 64)
+        cand["receipts"][kind] = {"receipt_id": rid, "at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
+            "certified_commit": certified_commit, "receipt": receipt}
+        cand["state_history"].append({"from": cand["state"], "to": to, "receipt_id": rid,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))})
+        prev = cand["state"]
+        cand["state"] = to
+
+        enqueued = []
+        if to in ("confirmed", "corrected"):
+            if (bug_class or "").lower() in DIRTY_BUG_CLASSES or receipt.get("dirty") is True:
+                a = _enqueue(led, args.candidate, "memory_bug_confirmed", "dirty_sweep")
+                enqueued.append(a["action_id"])
+        elif to == "needs-live-validation":
+            a = _enqueue(led, args.candidate, "server_dependency", "live_validation")
+            enqueued.append(a["action_id"])
+
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"transition": "ACCEPTED", "candidate_id": args.candidate,
+                      "from": prev, "to": to, "receipt_id": rid,
+                      "pending_enqueued": enqueued}, indent=2))
+    return 0
+
+
+def cmd_pending_complete(args) -> int:
+    root = _ensure_root(args.ledger, None)
+    receipt = _read_json_arg(args.receipt, args.file) if (args.receipt or args.file) else {}
+    with _Lock(root):
+        led = _load(root)
+        action = next((a for a in led["pending_actions"] if a.get("action_id") == args.action), None)
+        if action is None:
+            raise SystemExit(f"ledger pending-complete: unknown action {args.action!r}")
+        # a dirty_sweep completion must carry a valid sweep receipt
+        if action.get("required_action") == "dirty_sweep":
+            ok, errs = _validate_dirty_sweep(receipt)
+            if not ok:
+                print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
+                                  "errors": errs}, indent=2))
+                return 3
+        rid = _receipt_id(action["target"], "pending:" + action["required_action"], receipt)
+        action["state"] = "completed"
+        action["completion_receipt"] = {"receipt_id": rid, "receipt": receipt,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))}
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"pending_complete": "OK", "action_id": args.action, "receipt_id": rid}))
+    return 0
+
+
+def _open_sweeps_for_file(led: dict, file_path: str) -> list:
+    """Actions blocking closure of file_path: a queued dirty_sweep whose target candidate's
+    path is under (or equal to) file_path."""
+    blocking = []
+    for a in led["pending_actions"]:
+        if a.get("required_action") != "dirty_sweep" or a.get("state") == "completed":
+            continue
+        cand = led["candidates"].get(a.get("target", ""), {})
+        cpath = cand.get("path", "")
+        if cpath == file_path or cpath.startswith(file_path.rstrip("/") + "/") \
+                or file_path == cand.get("path", ""):
+            blocking.append(a["action_id"])
+    return blocking
+
+
+def cmd_file_close(args) -> int:
+    root = _ensure_root(args.ledger, None)
+    with _Lock(root):
+        led = _load(root)
+        blocking = _open_sweeps_for_file(led, args.file)
+        if blocking:
+            print(json.dumps({"file_close": "REFUSED", "file": args.file,
+                "open_sweep_actions": blocking,
+                "reason": "a proven-dirty file cannot close while its DIRTY_SWEEP is open"}, indent=2))
+            return 3
+        if args.file not in led["closed_files"]:
+            led["closed_files"].append(_cap(args.file, 256))
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"file_close": "OK", "file": args.file}))
+    return 0
+
+
+def cmd_summary(args) -> int:
+    root = assert_safe_ledger_root(Path(args.ledger), None)
+    led = _load(root)
+    refs, counts = [], {}
+    for cid, c in sorted(led["candidates"].items()):
+        st = c.get("state", "open")
+        counts[st] = counts.get(st, 0) + 1
+        rec_ids = {k: v.get("receipt_id") for k, v in c.get("receipts", {}).items()}
+        refs.append({"candidate_id": cid, "state": st, "component": c.get("component", ""),
+                     "path": c.get("path", ""), "receipts": rec_ids,
+                     "one_line": f"{cid} {st}" + (f" [{','.join(rec_ids.values())}]" if rec_ids else "")})
+    open_pending = [a for a in led["pending_actions"] if a.get("state") != "completed"]
+    payload = {"candidate_count": len(led["candidates"]), "state_counts": counts,
+               "open_pending_actions": open_pending, "cross_vendor_jobs": len(led["cross_vendor_jobs"]),
+               "closed_files": led["closed_files"], "candidates": refs,
+               "report_blocking": bool(open_pending)}
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def _read_component_lines(path: str) -> list:
+    """Read a newline-delimited component/id list, fail-closed like the KB helper's
+    inventory reader (invalid UTF-8 / oversize / traversal entry -> hard refusal)."""
+    p = Path(path)
+    if p.stat().st_size > MAX_INPUT_BYTES:
+        raise SystemExit(f"ledger: list {path} exceeds {MAX_INPUT_BYTES} bytes; refusing (fail-closed)")
+    out = []
+    for raw in p.read_bytes().splitlines():
+        try:
+            c = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            raise SystemExit(f"ledger: list {path} has invalid UTF-8; refusing (fail-closed)")
+        if not c or c.startswith("#"):
+            continue
+        out.append(c)
+    return out
+
+
+def _candidate_by_ref(led: dict, ref: str):
+    """Resolve a claim reference (candidate_id OR finding_sig) to a candidate."""
+    if ref in led["candidates"]:
+        return led["candidates"][ref]
+    for c in led["candidates"].values():
+        if c.get("finding_sig") == ref:
+            return c
+    return None
+
+
+def cmd_conformance(args) -> int:
+    """The deterministic closure gate: treat the finished run as a set of claims, each of
+    which must resolve to a ledger fact or a receipt. Machine set-difference, NOT a model
+    self-audit. Any non-empty diff is a gate FAILURE (exit 3)."""
+    root = assert_safe_ledger_root(Path(args.ledger), None)
+    led = _load(root)
+    failures = {}   # check -> list of offending items
+
+    def fail(check, items):
+        if items:
+            failures[check] = items
+
+    # (1) coverage completeness: every inventory component covered or explicitly omitted.
+    if args.inventory:
+        inv = set(_read_component_lines(args.inventory))
+        covered = set(_read_component_lines(args.covered)) if args.covered else set()
+        omitted = set(_read_component_lines(args.omitted)) if args.omitted else set()
+        fail("uncovered_components_implied_done", sorted(inv - covered - omitted))
+        # a component claimed covered that isn't in the inventory is a bookkeeping error
+        fail("covered_not_in_inventory", sorted(covered - inv))
+
+    # (2) ledger integrity: a terminal state MUST carry its receipt (guards direct edits
+    # that bypass the transition gate).
+    missing_receipt, unswept = [], []
+    for cid, c in led["candidates"].items():
+        st = c.get("state")
+        rcpts = c.get("receipts", {})
+        if st in ("confirmed", "corrected") and "confirmation" not in rcpts:
+            missing_receipt.append(f"{cid}:{st}:no-confirmation-receipt")
+        if st == "rejected" and "rejection" not in rcpts:
+            missing_receipt.append(f"{cid}:{st}:no-rejection-receipt")
+        # a confirmed proven-dirty file needs a completed sweep OR an open pending (never silently none)
+        if st in ("confirmed", "corrected") and (c.get("bug_class", "").lower() in DIRTY_BUG_CLASSES):
+            aid = _action_id(cid, "dirty_sweep")
+            act = next((a for a in led["pending_actions"] if a.get("action_id") == aid), None)
+            if act is None:
+                unswept.append(f"{cid}:dirty-class-confirmed-with-no-sweep-action")
+    fail("terminal_state_missing_receipt", missing_receipt)
+    fail("dirty_confirmed_without_sweep", unswept)
+
+    # (3) open pendings block the report.
+    open_pending = [f"{a['action_id']}:{a['required_action']}->{a['target']}"
+                    for a in led["pending_actions"] if a.get("state") != "completed"]
+    fail("open_pending_actions_block_report", open_pending)
+
+    # (4) staleness: a receipt certified against a different commit than the current tree.
+    if args.target:
+        cur = _run_git(Path(args.target), "rev-parse", "HEAD").strip()
+        if cur:
+            stale = []
+            for cid, c in led["candidates"].items():
+                for kind, r in c.get("receipts", {}).items():
+                    cc = r.get("certified_commit", "")
+                    if cc and cc != cur:
+                        stale.append(f"{cid}:{kind}:certified@{cc[:10]}!=head@{cur[:10]}")
+            fail("stale_receipts_vs_current_commit", stale)
+
+    # (5) claims manifest reconciliation: each claim resolves to a ledger fact.
+    if args.claims:
+        claims = _read_json_arg(None, args.claims)
+        want = {"confirmed": ("confirmed", "corrected"), "rejected": ("rejected",),
+                "needs_live": ("needs-live-validation",)}
+        bad = []
+        for key, states in want.items():
+            for ref in claims.get(key, []):
+                c = _candidate_by_ref(led, ref)
+                if c is None:
+                    bad.append(f"claim {key}:{ref} -> no such candidate in ledger")
+                elif c.get("state") not in states:
+                    bad.append(f"claim {key}:{ref} -> ledger says state={c.get('state')!r}")
+        fail("report_claims_contradict_ledger", bad)
+
+    ok = not failures
+    print(json.dumps({"conformance": "PASS" if ok else "FAIL",
+                      "checks_run": ["coverage", "ledger_integrity", "pending", "staleness", "claims"],
+                      "failures": failures}, indent=2))
+    return 0 if ok else 3
+
+
+# ================================ main =========================================
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="raptor-loop-ledger", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True); p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("add"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True)
+    p.add_argument("--record"); p.add_argument("--file")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("cross-vendor"); p.add_argument("--ledger", required=True)
+    p.add_argument("--job"); p.add_argument("--file")
+    p.set_defaults(func=cmd_cross_vendor)
+
+    p = sub.add_parser("transition"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True); p.add_argument("--candidate", required=True)
+    p.add_argument("--to", required=True); p.add_argument("--receipt"); p.add_argument("--file")
+    p.set_defaults(func=cmd_transition)
+
+    p = sub.add_parser("pending-complete"); p.add_argument("--ledger", required=True)
+    p.add_argument("--action", required=True); p.add_argument("--receipt"); p.add_argument("--file")
+    p.set_defaults(func=cmd_pending_complete)
+
+    p = sub.add_parser("file-close"); p.add_argument("--ledger", required=True)
+    p.add_argument("--file", required=True); p.set_defaults(func=cmd_file_close)
+
+    p = sub.add_parser("summary"); p.add_argument("--ledger", required=True)
+    p.set_defaults(func=cmd_summary)
+
+    p = sub.add_parser("conformance"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target"); p.add_argument("--inventory"); p.add_argument("--covered")
+    p.add_argument("--omitted"); p.add_argument("--claims")
+    p.set_defaults(func=cmd_conformance)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

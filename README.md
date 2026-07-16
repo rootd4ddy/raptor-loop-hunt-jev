@@ -16,7 +16,13 @@ module, or directory) and want vulnerabilities found — "audit this", "find eve
 | `SKILL.md` | The skill itself — methodology, altitudes, generate→judge→verify loop, severity rubric. |
 | `references/vuln-class-discovery.md` | Leaf-level per-class search procedure (source → sink → oracle → variants). |
 | `references/kb-schema.md` | Schema + storage for the monotonic-scrutiny cross-run knowledge base. |
+| `references/ledger-schema.md` | Schema + the disposition-time transition gate (candidate ledger + evidence receipts). |
 | `scripts/raptor-loop-kb` | Deterministic cross-run KB helper (can only ever *raise* hunt scrutiny, never lower it). |
+| `scripts/raptor-loop-ledger` | Engagement-scoped candidate state machine — certifies each disposition transition against an evidence receipt (confirmations, rejections, sweeps, PENDING actions). |
+| `scripts/test-raptor-loop-ledger` | Self-contained test for the ledger + conformance gate (30 assertions; no network, no RAPTOR imports). |
+| `scripts/raptor-loop-exec` | Execution-auth broker — a live-PoC command runs only under a typed capability grant (least-privilege sandbox plan; `--exec` via RAPTOR's `core.sandbox` when reachable, else refuse). |
+| `scripts/test-raptor-loop-exec` | Self-contained test for the broker (11 assertions; authority compliance). |
+| `eval/` | The 10-axis trap battery (recall, FP-resistance, false-rejection, counterfeit-evidence, sweep, pending, coverage-honesty, authority, staleness, ablation) — deterministic axes are the tests, live axes are orchestrator-driven fixtures. |
 
 ## Install
 
