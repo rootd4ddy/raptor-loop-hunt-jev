@@ -137,3 +137,8 @@ discoveries:
 ## Scope
 
 For defensive security research, education, and authorized penetration testing only.
+
+---
+
+> Oh — and RAPTOR is required. Obviously. It's right there in the name. 🦖
+> Go feed the bird → [github.com/gadievron/raptor](https://github.com/gadievron/raptor)
