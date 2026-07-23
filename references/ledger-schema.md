@@ -43,38 +43,70 @@ ledger** — a refused transition leaves it `open`, never dropped. Full `state_h
   `expected_predicate` (a machine-checkable signal — "looks exploitable" is rejected);
   `observed_artifacts` (≥1). **Crash-inflation guard:** `oracle_class=dos` (a bare crash) cannot
   confirm a memory-safety *exploitability* claim — use a sanitizer-class receipt, or file the DoS
-  impact. A confirmed memory-safety bug auto-enqueues a `dirty_sweep`.
+  impact. A confirmed memory-safety bug auto-enqueues a `dirty_sweep`. **Interpreter-sink guard:** a
+  confirmation of a finding whose `sink` is an interpreter/process (`psql`/shell/`exec`/`spawn`/`eval`/
+  deserializer/`restore`) rated **≥2 levels below** its severe high-water-mark must carry
+  `sink_semantics {invocation_mode, interpreter_grammar, execution_identity}` — so a "confirmed medium"
+  on a `psql` sink cannot ship without the argv/`\!`/execution-identity analysis (the F-22 lesson).
 - **rejected — rejection receipt:** `rejection_reason` ∈ {unreachable, non-exploitable,
   expected-behavior, duplicate, out-of-scope}; a `counter_hypothesis`; a `vector_matrix` where each
   row is `{vector, status}` and `tested` → `command_or_fixture` + `observed`, `not-applicable` →
   `rationale` (a bare list proves nothing; `enc` is a transform dimension, not a vector); for
   `unreachable`, a `gating` block (`build_digest`, `config_digest`, `route_or_symbol_evidence`); and
   `independent_review.job_id` referencing a **recorded** cross-vendor job whose `verdict` is
-  `uphold` (an overturn / inconclusive / unknown job REFUSES the kill).
+  `uphold` (an overturn / inconclusive / unknown job REFUSES the kill). **Invariant guard:** a kill
+  that relies on an invariant (`basis="invariant"`, or a `counter_hypothesis` asserting "always
+  single-owner / can only / by construction") requires `invariant_challenge {invariant,
+  enforcement_site, all_writers[], mutation_paths[], counterexample_tested}` — a construction path is
+  not proof; enumerate EVERY writer incl. bulk/import/restore/deser (the F-07 miss: `PUT /assets
+  {duplicateId}` was an unlisted writer). **Intended-behavior guard:** `rejection_reason=expected-behavior`
+  requires `policy_evidence {artifact, span_or_url}` citing a spec/doc/config that sanctions it — "a
+  sibling endpoint does it" is a second bug, not intent (F-18).
 - **needs-live-validation — validation receipt:** `safe_test` (exact request/command + expected
   vulnerable-vs-safe response) and `potential_severity`. First-class, not a soft reject;
   auto-enqueues a `live_validation`.
+- **material downgrade — `material_downgrade_receipt`:** a *severity* downgrade of a severe finding is
+  a partial rejection and carries the rejection burden. It is **DERIVED, never a caller-selected
+  label**: fires when the candidate's append-only `potential_hwm` ∈ {high, critical} AND the target is a
+  **≥2-level severity drop** (`corrected` with `effective_severity` ≥2 ranks below the hwm — so
+  `Critical→Medium` and `*→Low` trip but `Critical→High`/`High→Medium` do not; the F-22 restore-RCE was
+  capped `Critical→Medium`, which an "effective-Low only" rule missed) or `duplicate`/`out-of-scope`
+  without a `canonical_finding` that preserves it. The high-water-mark is retained, so `High→Medium→Low`
+  still trips. `rejected` (own gate), `confirmed` (oracle-gated), and
+  `needs-live`/`open` (kept alive) are exempt. The receipt needs `negated_hypothesis`,
+  `consequence_trace`, a bounded `trigger_paths[]` (each `{path_id, status ∈
+  tested|static-cleared|needs-live|needs-review, observed|evidence}` — a `needs-live`/`needs-review`
+  path is NOT cleared, so it refuses), `gating` digests, and `independent_review.job_id` referencing a
+  recorded cross-vendor job whose `verdict` is **`concur_downgrade`** (an
+  `overturn`/`inconclusive`/`uphold` refuses). Miss any → transition fails, candidate stays put, an
+  `incomplete_material_downgrade → complete_material_downgrade_bundle` action is enqueued.
 
 ## Cross-vendor jobs (the trusted channel)
 
-`raptor-loop-ledger cross-vendor --job '{"model":..,"target":..,"verdict":"uphold|overturn|inconclusive","evidence_hash":..}'`
-records an orchestrator-dispatched review as `J-<hash>`. A rejection receipt can only cite a job that
-exists here — the reasoner cannot invent `cross_vendor=…:UPHOLD`, because the verdict lives in a
-separate recorded step the orchestrator (not the judged reasoner) writes.
+`raptor-loop-ledger cross-vendor --job '{"model":..,"target":..,"verdict":"uphold|overturn|inconclusive|concur_downgrade","evidence_hash":..}'`
+records an orchestrator-dispatched review as `J-<hash>`. A rejection receipt cites a job whose verdict is
+`uphold`; a **material-downgrade** receipt cites one whose verdict is `concur_downgrade`. Either way the
+reasoner cannot invent the verdict — it lives in a separate recorded step the orchestrator (not the
+judged reasoner) writes.
 
 ## PENDING actions (the follow-up that cannot vanish)
 
 Auto-enqueued from *events*, never from a model remembering: `memory_bug_confirmed → dirty_sweep`,
-`server_dependency → live_validation`, `incomplete_rejection → complete_rejection_bundle`. A
-`dirty_sweep` closes only with a valid sweep receipt (`enumeration_recipe` +
-`discovered_sites` + `site_set_hash` — a grep-only sweep with no hash is refused).
-`file-close --file F` is REFUSED while a `dirty_sweep` for a candidate under `F` is open;
+`server_dependency → live_validation`, `incomplete_rejection → complete_rejection_bundle`,
+`incomplete_material_downgrade → complete_material_downgrade_bundle`, and `severe_sink_hypothesis →
+enumerate_trigger_paths`. The last is **sink-keyed** (id `S-<hash(sink)>`), shared by every candidate
+reaching that sink and carrying a `candidates[]` list, so the sink's ingress set is enumerated once
+across findings — closing it needs an `enumeration_recipe` (route/reference/dispatcher/loader searches,
+not a hand-picked file list) + a `trigger_paths[]` inventory, which is what stops a re-sweep from
+silently omitting the files that reach the sink. A `dirty_sweep` closes only with a valid sweep receipt
+(`enumeration_recipe` + `discovered_sites` + `site_set_hash` — a grep-only sweep with no hash is
+refused). `file-close --file F` is REFUSED while a `dirty_sweep` for a candidate under `F` is open;
 `summary.report_blocking` is true while any pending action is open, gating the report.
 
 ## CLI
 
 - `init --ledger DIR --target DIR` — create, stamp identity.
-- `add --ledger DIR --target DIR (--record JSON | -)` — register candidate (idempotent by signature).
+- `add --ledger DIR --target DIR (--record JSON | -)` — register candidate (idempotent by signature; refuses a placeholder/stub record — invalid-cell lint).
 - `cross-vendor --ledger DIR (--job JSON | -)` — record a dispatched review job.
 - `transition --ledger DIR --target DIR --candidate C --to STATE (--receipt JSON | -)` — the gate.
 - `pending-complete --ledger DIR --action A (--receipt JSON | -)` — close a pending action.
@@ -82,13 +114,15 @@ Auto-enqueued from *events*, never from a model remembering: `memory_bug_confirm
 - `summary --ledger DIR` — report-ready one-line refs, open pendings, `report_blocking`.
 - `conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F]` — the
   deterministic **closure gate**: machine set-diffs (inventory − covered − omitted; terminal-state
-  candidates missing their receipt; dirty-confirmed with no sweep; open pendings; receipts whose
-  `certified_commit ≠ HEAD`; a claims manifest that contradicts ledger state). Exit 3 = any diff
-  non-empty. This is the "verify claims, not just re-read your own work" pass — coverage and rejection
-  claims are checked, not only `confirmed` ones, because those are the claims that *suppress* work.
+  candidates missing their receipt; dirty-confirmed with no sweep; **a severe (High/Critical
+  high-water-mark) finding sitting at effective-Low with no material-downgrade receipt** — catches a
+  direct-edit / stair-step / alias-disposition bypass of the transition gate; open pendings; receipts
+  whose `certified_commit ≠ HEAD`; a claims manifest that contradicts ledger state). Exit 3 = any diff
+  non-empty. This is the "verify claims, not just re-read your own work" pass — coverage, rejection, and
+  downgrade claims are checked, not only `confirmed` ones, because those are the claims that *suppress* work.
 
-Self-test: `python3 scripts/test-raptor-loop-ledger` (30 assertions; no network, no RAPTOR imports).
-Eval battery + fixtures: `eval/README.md` (the 10-axis trap suite; deterministic axes are these tests,
+Self-test: `python3 scripts/test-raptor-loop-ledger` (52 assertions; no network, no RAPTOR imports).
+Eval battery + fixtures: `eval/README.md` (the 11-axis trap suite; deterministic axes are these tests,
 live-model axes are orchestrator-driven).
 
 ## Why this is safe / what it is not

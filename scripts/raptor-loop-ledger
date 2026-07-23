@@ -66,11 +66,64 @@ ORACLE_CLASSES = {
 REJECT_REASONS = {"unreachable", "non-exploitable", "expected-behavior", "duplicate", "out-of-scope"}
 DELIVERY_VECTORS = {"path", "query", "body", "cookie", "header", "enc-request", "cli", "env", "config", "other"}
 VECTOR_STATUS = {"tested", "not-applicable"}
-REVIEW_VERDICTS = {"uphold", "overturn", "inconclusive"}
+# uphold/overturn/inconclusive judge a rejection; concur_downgrade concurs with a *material downgrade*
+# of a severe finding to Low (see the material-downgrade gate). A downgrade may cite only concur_downgrade.
+REVIEW_VERDICTS = {"uphold", "overturn", "inconclusive", "concur_downgrade"}
 PENDING_STATES = {"queued", "completed", "blocked"}
 # bug classes that make a confirmed finding "proven-dirty" -> auto file sweep
 DIRTY_BUG_CLASSES = {"memory-safety", "memory", "cwe-119", "cwe-120", "cwe-122",
                      "cwe-125", "cwe-787", "cwe-416", "cwe-415", "cwe-190", "cwe-476"}
+
+# ---- severity lattice: the material-downgrade gate is DERIVED from these, never from a
+# caller-chosen transition label (gpt-5.6-sol review). rank[potential] >= HIGH + effective-final
+# classification collapses to Low/hardening/extinguished == a partial rejection carrying the full burden.
+SEVERITY_RANK = {"": 0, "none": 0, "info": 1, "informational": 1, "hardening": 1,
+                 "not-security": 1, "low": 1, "medium": 2, "med": 2, "high": 3, "critical": 4}
+SEVERE_HWM = 3  # HIGH and above is a "severe high-water mark"
+# a target severity at/below this rank is an "effective-Low" landing (a claim-extinguishing floor)
+EFFECTIVE_LOW = 1
+# a material downgrade is a >=2-LEVEL severity drop from a severe high-water mark. This catches
+# Critical->Medium (4-2=2) as well as *->Low, while Critical->High (1) and High->Medium (1) stay
+# ordinary corrections (gpt-5.6-sol amendment: the F-22 restore-RCE was capped Critical->Medium, a
+# 2-level drop an "effective-Low only" rule would miss).
+MIN_MATERIAL_DROP = 2
+# sinks whose SEMANTICS decide impact — a confirmation that under-rates one of these must carry the
+# sink-semantic fields (invocation mode, interpreter grammar/metacommands, execution identity), so a
+# "confirmed medium" on a psql/shell sink cannot ship without the `\!`/argv analysis (F-22 lesson).
+INTERPRETER_SINK_RE = ("psql", "sqlite", "mysql", "/bin/sh", "bash", " sh ", "exec", "spawn", "system(",
+                       "eval", "deseriali", "pickle", "yaml.load", "marshal", "restore", "child_process")
+
+
+def _sev_rank(s) -> int:
+    return SEVERITY_RANK.get(str(s or "").strip().lower(), 0)
+
+
+def _material_drop(hwm_rank: int, target_rank: int) -> bool:
+    """A severe (>=HIGH) finding dropping >=2 severity levels to its target rating."""
+    return hwm_rank >= SEVERE_HWM and (hwm_rank - target_rank) >= MIN_MATERIAL_DROP
+
+
+PLACEHOLDER_TOKENS = {"", "test", "tbd", "todo", "placeholder", "xxx", "x", "a", "f", "na", "n/a",
+                      "foo", "bar", "baz", "none", "-", "example", "sample", "dummy"}
+
+
+def _looks_trivial(v) -> bool:
+    """A placeholder-ish token: a known stub word or a <=2-char value carrying no locus."""
+    v = str(v).strip().lower()
+    return v in PLACEHOLDER_TOKENS or len(v) <= 2
+
+
+def _looks_placeholder(rec: dict) -> bool:
+    """A stub/placeholder candidate (all fields literal 'test', evidence file 'a' line 1) is an
+    INVALID cell execution, not valid negative evidence — it must fail, forcing a rerun. This is the
+    B3-style artifact that silently passed as a completed 'dry' cell (gpt-5.6-sol invalid-cell lint).
+    Conservative on false-REJECTION (a short-but-real signature is fine as long as SOME locus is
+    substantive); the real signal is 'no substantive content anywhere'."""
+    sig = str(rec.get("finding_sig", "")).strip().lower()
+    if sig in PLACEHOLDER_TOKENS or not sig:
+        return True
+    # a real candidate names at least one substantive locus (component / path / sink / entry point)
+    return all(_looks_trivial(rec.get(k)) for k in ("component", "path", "sink", "entry_point"))
 
 
 # ============================ shared primitives ================================
@@ -337,6 +390,47 @@ def _validate_rejection(receipt: dict, ledger: dict) -> tuple[bool, list]:
             for f in ("build_digest", "config_digest", "route_or_symbol_evidence"):
                 if not str(g.get(f, "")).strip():
                     errs.append(f"gating.{f} required for an unreachable kill (observed, not asserted)")
+    # INVARIANT kills (gpt-5.6-sol): "X is always single-owner / can only ever be Y" is the F-07/F-20
+    # failure — a construction path is not an invariant. Require the FULL writer inventory + a challenge.
+    ch = str(receipt.get("counter_hypothesis", "")).lower()
+    INV_SIGNAL = ("single-owner", "single owner", "per-owner", "one owner", "sole owner", "uniquely owned",
+                  "at most one", "only one", "owned by the", "always ", "only ever", "guaranteed",
+                  "invariant", "can only", "cannot be", "never ", "by construction", "always scoped")
+    if receipt.get("basis") == "invariant" or any(s in ch for s in INV_SIGNAL):
+        inv = receipt.get("invariant_challenge")
+        if not isinstance(inv, dict):
+            errs.append("this kill relies on an INVARIANT (e.g. 'always single-owner') -> requires an "
+                        "invariant_challenge {invariant, enforcement_site, all_writers[], mutation_paths[], "
+                        "counterexample_tested} — a construction path is NOT proof the invariant holds")
+        else:
+            if not str(inv.get("invariant", "")).strip():
+                errs.append("invariant_challenge.invariant required (state the exact invariant relied on)")
+            if not str(inv.get("enforcement_site", "")).strip():
+                errs.append("invariant_challenge.enforcement_site required (where it is enforced)")
+            aw = inv.get("all_writers")
+            # each writer must be a SUBSTANTIVE locus (file:sym/route), not a placeholder like "x"
+            good_writers = [w for w in aw if isinstance(aw, list) and isinstance(w, str)
+                            and not _looks_trivial(w)]
+            if not isinstance(aw, list) or not good_writers:
+                errs.append("invariant_challenge.all_writers[] required with SUBSTANTIVE entries — enumerate "
+                            "EVERY writer to the invariant-bearing field/relation incl. bulk/import/restore/"
+                            "deser (the F-07 miss: PUT /assets {duplicateId} was an unlisted writer)")
+            if not isinstance(inv.get("mutation_paths"), list):
+                errs.append("invariant_challenge.mutation_paths[] required (the write/import/bulk paths that "
+                            "could violate the invariant)")
+            if not isinstance(inv.get("counterexample_tested"), bool):
+                errs.append("invariant_challenge.counterexample_tested required (bool: did you try to break it)")
+    # INTENDED-BEHAVIOR kills: "a sibling endpoint already exposes it" is NOT product intent. Require a
+    # real policy artifact WITH the sanctioning quote; a contrary privacy control (publicUsers) is evidence
+    # AGAINST, not for (F-18). NB: the ledger enforces the receipt's STRUCTURE — whether the artifact truly
+    # sanctions the behavior is the cross-vendor judge's semantic call, not a string check.
+    if reason == "expected-behavior":
+        pe = receipt.get("policy_evidence")
+        if not isinstance(pe, dict) or not str(pe.get("artifact", "")).strip() \
+                or not str(pe.get("span_or_url", "")).strip() or not str(pe.get("quote", "")).strip():
+            errs.append("rejection_reason=expected-behavior requires policy_evidence {artifact, span_or_url, "
+                        "quote} citing an explicit spec/doc/config whose QUOTE sanctions this — a sibling "
+                        "exposure or 'another endpoint does it' is not intent (it may be a second bug)")
     # cross-vendor: MUST reference a recorded orchestrator-dispatched job that UPHELD the kill.
     ir = receipt.get("independent_review")
     job_id = ir.get("job_id") if isinstance(ir, dict) else None
@@ -396,6 +490,9 @@ def cmd_add(args) -> int:
     rec = _read_json_arg(args.record, args.file)
     if not str(rec.get("finding_sig", "")).strip():
         raise SystemExit("ledger add: record.finding_sig required (stable candidate signature)")
+    if _looks_placeholder(rec):
+        raise SystemExit("ledger add: refusing a placeholder/stub candidate (fields look like 'test'/'a'/"
+                         "empty) — this is an invalid cell execution, not a finding; rerun the cell")
     cid = _candidate_id(rec)
     with _Lock(root):
         led = _load(root)
@@ -403,6 +500,7 @@ def cmd_add(args) -> int:
             raise SystemExit("ledger: candidate cap reached; refusing")
         existing = led["candidates"].get(cid)
         if existing is None:
+            pot = _cap(rec.get("potential_severity", ""), 16)
             led["candidates"][cid] = {
                 "candidate_id": cid,
                 "finding_sig": _cap(rec.get("finding_sig", ""), 128),
@@ -414,10 +512,24 @@ def cmd_add(args) -> int:
                 "bug_class": _cap(rec.get("bug_class", ""), 64),
                 "created_by": _cap(rec.get("created_by", ""), 128),
                 "created_commit": _cap(rec.get("commit", ""), 64),
+                "potential_severity": pot,
+                # append-only severe high-water mark — the material-downgrade gate reads THIS,
+                # not the current re-rate, so High->Medium->Low laundering cannot reset it.
+                "potential_hwm": pot if _sev_rank(pot) >= SEVERE_HWM else "",
                 "state": "open",
                 "state_history": [],
                 "receipts": {},
             }
+        else:
+            # raise the high-water mark if a later add reports a more severe potential (never lower it)
+            pot = _cap(rec.get("potential_severity", ""), 16)
+            if _sev_rank(pot) > _sev_rank(existing.get("potential_hwm", "")):
+                existing["potential_hwm"] = pot
+        cand = led["candidates"][cid]
+        # severe-sink hypothesis (potential>=HIGH reaching a named sink) auto-enqueues a SINK-KEYED
+        # trigger-path enumeration — it blocks a material downgrade + the sink's coverage, not the file.
+        if _sev_rank(cand.get("potential_hwm", "")) >= SEVERE_HWM and str(cand.get("sink", "")).strip():
+            _enqueue_sink(led, cand, "severe_sink_hypothesis", "enumerate_trigger_paths")
         led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
         _atomic_write(root, led)
     print(json.dumps({"candidate_id": cid, "state": led["candidates"][cid]["state"],
@@ -467,6 +579,173 @@ def _enqueue(led: dict, target_cid: str, trigger: str, required_action: str) -> 
     return action
 
 
+def _sink_key(cand: dict) -> str:
+    """Stable id for a sink so the enumeration action is keyed by the SINK, not per-endpoint —
+    several candidates reaching the same sink share one enumeration (gpt-5.6-sol review, missing #1)."""
+    return "S-" + hashlib.sha256((cand.get("sink", "") or cand.get("component", "")).encode()).hexdigest()[:16]
+
+
+def _enqueue_sink(led: dict, cand: dict, trigger: str, required_action: str) -> dict:
+    skey = _sink_key(cand)
+    aid = "A-" + hashlib.sha256((skey + "|" + required_action).encode()).hexdigest()[:16]
+    for a in led["pending_actions"]:
+        if a.get("action_id") == aid and a.get("state") != "completed":
+            if cand["candidate_id"] not in a.setdefault("candidates", []):
+                a["candidates"].append(cand["candidate_id"])
+            return a
+    action = {"action_id": aid, "trigger": trigger, "target": skey, "sink_key": skey,
+              "candidates": [cand["candidate_id"]], "required_action": required_action,
+              "state": "queued", "completion_receipt": None,
+              "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))}
+    if len(led["pending_actions"]) < MAX_PENDING:
+        led["pending_actions"].append(action)
+    return action
+
+
+GATING_DIGEST_KEYS = {"build", "build_digest", "route", "route_or_symbol_evidence", "sink",
+                      "sink_digest", "config", "config_digest", "commit"}
+
+
+def _cand_hwm(cand: dict) -> int:
+    """Recompute the severe high-water-mark defensively — max of the stored hwm AND the created
+    potential (so lowering `potential_hwm` alone via a direct edit does not shrink the severity)."""
+    return max(_sev_rank(cand.get("potential_hwm", "")), _sev_rank(cand.get("potential_severity", "")))
+
+
+def _canonical_preserves(led: dict, receipt: dict, self_cid: str = "") -> bool:
+    """A duplicate/out-of-scope of a severe finding is only NON-material when it links to a canonical
+    candidate that EXISTS, is still severe, is not the finding itself, and is not itself
+    extinguished-to-Low (gpt-5.6-sol fix #1 + self-reference guard — a nonblank string, a self-pointer,
+    or a downgraded canonical is not a preservation)."""
+    ref = str(receipt.get("canonical_finding", "")).strip()
+    if not ref:
+        return False
+    canon = _candidate_by_ref(led, ref)
+    if canon is None or canon.get("candidate_id") == self_cid or _cand_hwm(canon) < SEVERE_HWM:
+        return False
+    st = canon.get("state")
+    if st in ("rejected", "out-of-scope"):
+        return False
+    if st == "corrected":
+        eff = (canon.get("receipts", {}).get("confirmation", {}).get("receipt", {}) or {})
+        if _sev_rank(eff.get("effective_severity", eff.get("severity", ""))) <= EFFECTIVE_LOW:
+            return False
+    return True
+
+
+def _is_material_downgrade(cand: dict, to: str, receipt: dict, led: dict) -> bool:
+    """DERIVED, never caller-selected: a severe (>=HIGH high-water-mark) finding landing at an
+    effective-final Low/hardening classification, or extinguished (duplicate/out-of-scope) without a
+    VERIFIED preserving canonical link. `rejected` is EXEMPT (its own rejection gate is >= this burden);
+    `confirmed` is EXEMPT (oracle-gated positive evidence of the rated impact); `needs-live`/`open`
+    keep the finding alive so are NOT downgrades (gpt-5.6-sol threshold)."""
+    hwm = _cand_hwm(cand)
+    if hwm < SEVERE_HWM:
+        return False
+    if to in ("rejected", "confirmed", "needs-live-validation", "open"):
+        return False
+    if to == "corrected":
+        eff = _sev_rank(receipt.get("effective_severity", receipt.get("severity", "")))
+        return _material_drop(hwm, eff)   # >=2-level drop (Critical->Medium included)
+    if to in ("duplicate", "out-of-scope"):
+        # extinguishing a severe finding drops it to rank 0 (>=2 levels) unless a canonical preserves it
+        return not _canonical_preserves(led, receipt, cand.get("candidate_id", ""))
+    return False
+
+
+def _interpreter_sink(cand: dict) -> bool:
+    # coerce every locus to str (a non-string field must not raise) and scan all of them, not just sink.
+    # This is a heuristic BACKSTOP — the boundary-scout DANGEROUS-SINK check is the primary classifier;
+    # over-match only asks for sink_semantics (mild), under-match is caught upstream.
+    s = " ".join(str(cand.get(k, "")) for k in ("sink", "finding_sig", "component", "entry_point")).lower()
+    return any(tok in s for tok in INTERPRETER_SINK_RE)
+
+
+def _validate_interpreter_confirmation(receipt: dict, cand: dict) -> tuple[bool, list]:
+    """A confirmation that rates an interpreter/process-sink finding >=2 levels BELOW its severe
+    high-water-mark must prove it opened the sink's semantics — otherwise 'confirmed medium' ships
+    without the argv/`\\!`/execution-identity analysis that turns F-22 restore into root RCE."""
+    hwm = _cand_hwm(cand)
+    conf = _sev_rank(receipt.get("effective_severity", receipt.get("severity", "")))
+    if not (_interpreter_sink(cand) and _material_drop(hwm, conf)):
+        return True, []
+    ss = receipt.get("sink_semantics")
+    if not isinstance(ss, dict):
+        return False, ["confirmation of an interpreter/process sink rated >=2 levels below its "
+                       "High/Critical high-water-mark requires sink_semantics {invocation_mode, "
+                       "interpreter_grammar, execution_identity} — trace the sink before capping severity"]
+    errs = [f"sink_semantics.{k} required" for k in ("invocation_mode", "interpreter_grammar",
+            "execution_identity") if not str(ss.get(k, "")).strip()]
+    return (not errs), errs
+
+
+def _validate_material_downgrade(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    """The downgrade bundle: negated hypothesis, consequence/impact-cap trace, a BOUNDED inventory of
+    UNIQUE statically-discoverable distinct trigger paths each with PATH-SCOPED evidence (a failed test on
+    one path is evidence for THAT path only), gating digests, and a recorded cross-vendor CONCUR_DOWNGRADE
+    job BOUND to this candidate (gpt-5.6-sol fixes #2 job-binding, #5 unique-paths/gating-fields)."""
+    md = receipt.get("material_downgrade_receipt")
+    errs = []
+    if not isinstance(md, dict):
+        return False, ["material_downgrade_receipt required: this is a High/Critical finding being "
+                       "re-rated to Low — a partial rejection that carries the rejection proof burden"]
+    if not str(md.get("negated_hypothesis", "")).strip():
+        errs.append("material_downgrade_receipt.negated_hypothesis required (the severe claim being negated)")
+    if not str(md.get("consequence_trace", "")).strip():
+        errs.append("material_downgrade_receipt.consequence_trace required (impact-cap evidence: what the "
+                    "sink actually does / why the ceiling is Low)")
+    paths = md.get("trigger_paths")
+    if not isinstance(paths, list) or not paths:
+        errs.append("material_downgrade_receipt.trigger_paths required: inventory EVERY statically-"
+                    "discoverable distinct ingress to the sink (unauth/authed/admin/internal/loader)")
+    else:
+        allowed = {"tested", "static-cleared", "needs-live", "needs-review"}
+        seen = set()
+        for i, p in enumerate(paths):
+            # path_id must be a non-empty STRING — a dict/list id would crash the set (gpt-5.6-sol new-issue)
+            if not isinstance(p, dict) or not isinstance(p.get("path_id"), str) or not p["path_id"].strip():
+                errs.append(f"trigger_paths[{i}]: path_id required (a non-empty string)"); continue
+            pid = p["path_id"].strip()
+            if pid in seen:
+                errs.append(f"trigger_paths: duplicate path_id {pid!r} (pad-the-inventory guard)")
+            seen.add(pid)
+            st = p.get("status")
+            if st not in allowed:
+                errs.append(f"trigger_paths[{pid}]: status must be one of {sorted(allowed)}")
+            if st == "tested" and not str(p.get("observed", "")).strip():
+                errs.append(f"trigger_paths[{pid}]: tested requires path-scoped `observed`")
+            if st in ("static-cleared", "needs-review") and not str(p.get("evidence", "")).strip():
+                errs.append(f"trigger_paths[{pid}]: {st} requires `evidence`")
+        # a path left needs-live/needs-review is NOT cleared -> the downgrade is not yet earned
+        unresolved = [p.get("path_id") for p in paths if isinstance(p, dict)
+                      and p.get("status") in ("needs-live", "needs-review")]
+        if unresolved:
+            errs.append(f"trigger_paths still unresolved (not silently safe): {unresolved} — resolve or "
+                        "keep the finding open, do not finalize Low")
+    g = md.get("gating")
+    if not isinstance(g, dict) or not any(k in GATING_DIGEST_KEYS and str(v).strip()
+                                          for k, v in g.items()):
+        errs.append(f"material_downgrade_receipt.gating required with a recognised, NON-EMPTY digest "
+                    f"field ({sorted(GATING_DIGEST_KEYS)}) binding the evidence to the reviewed code")
+    ir = md.get("independent_review")
+    if not isinstance(ir, dict) or not str(ir.get("job_id", "")).strip():
+        errs.append("material_downgrade_receipt.independent_review.job_id required (an orchestrator-"
+                    "dispatched cross-vendor review; the reasoner cannot self-attest it)")
+    else:
+        job = led.get("cross_vendor_jobs", {}).get(ir["job_id"])
+        if job is None:
+            errs.append(f"independent_review.job_id {ir['job_id']!r} not a recorded cross-vendor job")
+        elif job.get("verdict") != "concur_downgrade":
+            errs.append(f"cross-vendor job verdict is {job.get('verdict')!r}; a material downgrade needs "
+                        "concur_downgrade — an overturn/inconclusive/uphold does NOT permit it")
+        # the job must be BOUND to THIS candidate's immutable id — a concur_downgrade for one finding
+        # cannot be reused for another (finding_sig is NOT accepted: it is not unique across components)
+        elif cand is not None and job.get("target") != cand.get("candidate_id"):
+            errs.append(f"cross-vendor job targets {job.get('target')!r}, not this candidate_id "
+                        f"({cand.get('candidate_id')}) — a review cannot be reused across findings")
+    return (not errs), errs
+
+
 def cmd_transition(args) -> int:
     root = _ensure_root(args.ledger, args.target)
     to = args.to
@@ -483,6 +762,10 @@ def cmd_transition(args) -> int:
         # validate the receipt for the target state
         if to in ("confirmed", "corrected"):
             ok, errs = _validate_confirmation(receipt, bug_class)
+            if ok:
+                iok, ierrs = _validate_interpreter_confirmation(receipt, cand)
+                if not iok:
+                    ok, errs = False, ierrs
             kind = "confirmation"
         elif to == "rejected":
             ok, errs = _validate_rejection(receipt, led)
@@ -495,10 +778,23 @@ def cmd_transition(args) -> int:
             errs = [] if ok else ["reason required for duplicate/out-of-scope"]
             kind = "note"
 
+        # MATERIAL-DOWNGRADE GATE (derived, label-agnostic): a severe (>=HIGH high-water-mark) finding
+        # re-rated to effective-Low via corrected/duplicate/out-of-scope is a PARTIAL REJECTION and
+        # carries the rejection proof burden. This is the gate the F-22 restore-RCE downgrade escaped:
+        # High->Low recorded as a `corrected` re-rate slid past the reject-only gate.
+        if ok and _is_material_downgrade(cand, to, receipt, led):
+            mok, merrs = _validate_material_downgrade(receipt, led, cand)
+            if not mok:
+                ok = False
+                errs = ["MATERIAL DOWNGRADE of a High/Critical finding to Low — carries the full "
+                        "rejection burden:"] + merrs
+
         if not ok:
             # REFUSED. Candidate stays where it is. Enqueue the follow-up that closes the gap.
             if to == "rejected":
                 _enqueue(led, args.candidate, "incomplete_rejection", "complete_rejection_bundle")
+            elif _is_material_downgrade(cand, to, receipt, led):
+                _enqueue(led, args.candidate, "incomplete_material_downgrade", "complete_material_downgrade_bundle")
             _atomic_write(root, led)
             out = {"transition": "REFUSED", "candidate_id": args.candidate,
                    "requested_state": to, "current_state": cand["state"], "errors": errs}
@@ -511,6 +807,10 @@ def cmd_transition(args) -> int:
         cand["receipts"][kind] = {"receipt_id": rid, "at": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
             "certified_commit": certified_commit, "receipt": receipt}
+        # a material downgrade that passed the gate records its own receipt so conformance can prove it
+        if _is_material_downgrade(cand, to, receipt, led):
+            cand["receipts"]["material_downgrade"] = {"receipt_id": rid, "certified_commit": certified_commit,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())), "receipt": receipt.get("material_downgrade_receipt")}
         cand["state_history"].append({"from": cand["state"], "to": to, "receipt_id": rid,
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))})
         prev = cand["state"]
@@ -545,6 +845,23 @@ def cmd_pending_complete(args) -> int:
         if action.get("required_action") == "dirty_sweep":
             ok, errs = _validate_dirty_sweep(receipt)
             if not ok:
+                print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
+                                  "errors": errs}, indent=2))
+                return 3
+        # a trigger-path enumeration closes only with the inventory + how the scope was derived —
+        # the discovered paths must MECHANICALLY include the sink's callers/routes/dispatchers/loaders
+        # (gpt-5.6-sol review, missing #1: fixes the mis-scoped re-sweep that silently omits files).
+        if action.get("required_action") == "enumerate_trigger_paths":
+            paths = receipt.get("trigger_paths")
+            recipe = str(receipt.get("enumeration_recipe", "")).strip()
+            errs = []
+            if not recipe:
+                errs.append("enumeration_recipe required (the route/reference/dispatcher/loader searches "
+                            "run to establish the path set — not a manually chosen file list)")
+            if not isinstance(paths, list) or not paths:
+                errs.append("trigger_paths required: every statically-discoverable distinct ingress to "
+                            "the sink, each with a status (tested/static-cleared/needs-live/needs-review)")
+            if errs:
                 print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
                                   "errors": errs}, indent=2))
                 return 3
@@ -684,6 +1001,34 @@ def cmd_conformance(args) -> int:
                     for a in led["pending_actions"] if a.get("state") != "completed"]
     fail("open_pending_actions_block_report", open_pending)
 
+    # (3b) material-downgrade laundering: a severe (>=HIGH high-water-mark) finding that landed at an
+    # effective-Low TERMINAL state must carry a material_downgrade receipt. Catches a High->Low re-rate
+    # slipped in by a direct edit that bypassed the transition gate, incl. stair-step (High->Med->Low)
+    # and alias dispositions (corrected/duplicate/out-of-scope). An OPEN needs-live High is fine (alive).
+    laundered = []
+    for cid, c in led["candidates"].items():
+        if _cand_hwm(c) < SEVERE_HWM:   # defensive: max(hwm, created potential) — direct-edit resistant
+            continue
+        st = c.get("state")
+        rcpts = c.get("receipts", {})
+        landed_low = False
+        if st == "corrected":
+            eff = (rcpts.get("confirmation", {}).get("receipt", {}) or {})
+            landed_low = _material_drop(_cand_hwm(c), _sev_rank(eff.get("effective_severity", eff.get("severity", ""))))
+        elif st in ("duplicate", "out-of-scope"):
+            note = (rcpts.get("note", {}).get("receipt", {}) or {})
+            landed_low = not _canonical_preserves(led, note, cid)
+        if not landed_low:
+            continue
+        # re-run FULL validation on the stored receipt — an empty/fake material_downgrade key must not
+        # defeat the check (gpt-5.6-sol fix #3). Reconstruct the wrapper the validator expects.
+        stored = (rcpts.get("material_downgrade", {}) or {}).get("receipt")
+        mok, _ = _validate_material_downgrade({"material_downgrade_receipt": stored}, led, c) if stored else (False, [])
+        if not mok:
+            laundered.append(f"{cid}:hwm={c.get('potential_hwm') or c.get('potential_severity')}->{st}"
+                             f":effective-Low:no-valid-material-downgrade-receipt")
+    fail("severe_finding_downgraded_to_low_without_receipt", laundered)
+
     # (4) staleness: a receipt certified against a different commit than the current tree.
     if args.target:
         cur = _run_git(Path(args.target), "rev-parse", "HEAD").strip()
@@ -713,7 +1058,8 @@ def cmd_conformance(args) -> int:
 
     ok = not failures
     print(json.dumps({"conformance": "PASS" if ok else "FAIL",
-                      "checks_run": ["coverage", "ledger_integrity", "pending", "staleness", "claims"],
+                      "checks_run": ["coverage", "ledger_integrity", "pending",
+                                     "material_downgrade_laundering", "staleness", "claims"],
                       "failures": failures}, indent=2))
     return 0 if ok else 3
 

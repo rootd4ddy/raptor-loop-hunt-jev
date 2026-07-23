@@ -213,6 +213,229 @@ def main():
         check("conformance PASSES when covered, no open pendings, no bad claims",
               rc == 0 and out["conformance"] == "PASS", out.get("failures"))
 
+        # ================= MATERIAL-DOWNGRADE GATE + F-22 regression (fresh ledger) =================
+        L2 = ["--ledger", os.path.join(tmp, "out", "ledger2")]
+        run("init", *L2, "--target", target)
+
+        SS = {"invocation_mode": "stdin script", "interpreter_grammar": "psql \\! meta-command",
+              "execution_identity": "container root"}
+        def conf(eff, ss=False):  # a valid confirmation receipt carrying an effective severity
+            r = {"oracle_class": "authorization", "replay_command": "curl ...", "input_hash": "h1",
+                 "expected_predicate": "status==200 and body has X", "observed_artifacts": ["a1"],
+                 "effective_severity": eff}
+            if ss: r["sink_semantics"] = SS
+            return r
+
+        # severe finding reaching a named sink -> auto-enqueues a SINK-KEYED enumerate_trigger_paths
+        restore = json.dumps({"finding_sig": "sig-restore-rce", "component": "server/maintenance",
+            "path": "server/src/services/database-backup.service.ts", "entry_point": "POST /admin/database-backups/start-restore",
+            "sink": "psql <- uploaded backup content", "violated_invariant": "backup CONTENT unvalidated",
+            "bug_class": "cwe-78", "potential_severity": "critical"})
+        rc, out, _ = run("add", *L2, "--target", target, "--record", restore)
+        rcid = out["candidate_id"]
+        _, s, _ = run("summary", *L2)
+        pend = [a["required_action"] for a in s.get("open_pending_actions", [])]
+        check("severe-sink hypothesis auto-enqueues enumerate_trigger_paths", "enumerate_trigger_paths" in pend)
+
+        # CASE 1: High/Crit -> corrected Low WITHOUT a material_downgrade_receipt is REFUSED (the F-22 gap)
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", rcid,
+                         "--to", "corrected", "--receipt", json.dumps(conf("low")))
+        check("material downgrade (severe->Low) without receipt REFUSED", rc == 3 and out.get("transition") == "REFUSED")
+        check("refused downgrade enqueues complete_material_downgrade_bundle",
+              any("complete_material_downgrade_bundle" in a.get("required_action", "")
+                  for a in run("summary", *L2)[1].get("open_pending_actions", [])))
+
+        # CASE 2: High -> Medium is an ORDINARY correction, NOT material (needs no downgrade bundle)
+        med = json.dumps({"finding_sig": "sig-hi-med", "component": "c", "path": "parser.c",
+            "sink": "x", "bug_class": "authz", "potential_severity": "high"})
+        mcid = run("add", *L2, "--target", target, "--record", med)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", mcid,
+                         "--to", "corrected", "--receipt", json.dumps(conf("medium")))
+        check("severe->Medium correction ACCEPTED (not material)", rc == 0 and out.get("transition") == "ACCEPTED")
+
+        # CASE 3: Critical -> High correction is NOT material
+        crH = json.dumps({"finding_sig": "sig-crit-high", "component": "c", "path": "parser.c",
+            "sink": "x", "bug_class": "authz", "potential_severity": "critical"})
+        chid = run("add", *L2, "--target", target, "--record", crH)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", chid,
+                         "--to", "corrected", "--receipt", json.dumps(conf("high")))
+        check("critical->High correction ACCEPTED (not material)", rc == 0 and out.get("transition") == "ACCEPTED")
+
+        # CASE 4: downgrade citing an OVERTURN cross-vendor job is REFUSED (needs concur_downgrade)
+        run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid, "verdict": "overturn"}))
+        ov_job = run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid, "verdict": "overturn"}))[1]["job_id"]
+        md_overturn = conf("low", ss=True); md_overturn["material_downgrade_receipt"] = {
+            "negated_hypothesis": "restore is only a DoS", "consequence_trace": "psql streams content",
+            "trigger_paths": [{"path_id": "start-restore", "status": "tested", "observed": "400 getAdmin"}],
+            "gating": {"build": "b1"}, "independent_review": {"job_id": ov_job}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", rcid,
+                         "--to", "corrected", "--receipt", json.dumps(md_overturn))
+        check("downgrade citing OVERTURN job REFUSED (needs concur_downgrade)",
+              rc == 3 and any("concur_downgrade" in e for e in out.get("errors", [])))
+
+        # CASE 5: downgrade with an UNRESOLVED trigger path (needs-live) is REFUSED (not silently safe)
+        cd_job = run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid,
+            "verdict": "concur_downgrade"}))[1]["job_id"]
+        md_unresolved = conf("low", ss=True); md_unresolved["material_downgrade_receipt"] = {
+            "negated_hypothesis": "n", "consequence_trace": "t",
+            "trigger_paths": [{"path_id": "start-restore", "status": "tested", "observed": "400 getAdmin"},
+                              {"path_id": "admin-maintenance", "status": "needs-live", "evidence": "not tested"}],
+            "gating": {"build": "b1"}, "independent_review": {"job_id": cd_job}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", rcid,
+                         "--to", "corrected", "--receipt", json.dumps(md_unresolved))
+        check("downgrade with an unresolved trigger path REFUSED", rc == 3 and
+              any("unresolved" in e for e in out.get("errors", [])))
+
+        # CASE 6: COMPLETE downgrade bundle (both paths resolved + concur_downgrade job) is ACCEPTED
+        md_ok = conf("low", ss=True); md_ok["material_downgrade_receipt"] = {
+            "negated_hypothesis": "n", "consequence_trace": "psql content streamed; both paths gated",
+            "trigger_paths": [{"path_id": "start-restore", "status": "tested", "observed": "400 getAdmin"},
+                              {"path_id": "admin-maintenance", "status": "tested", "observed": "403 non-admin"}],
+            "gating": {"build": "b1", "route": "r1"}, "independent_review": {"job_id": cd_job}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", rcid,
+                         "--to", "corrected", "--receipt", json.dumps(md_ok))
+        check("complete material-downgrade bundle ACCEPTED", rc == 0 and out.get("transition") == "ACCEPTED")
+
+        # CASE 7: duplicate/out-of-scope of a severe finding WITHOUT a canonical link is a material downgrade
+        oos = json.dumps({"finding_sig": "sig-oos", "component": "c", "path": "parser.c",
+            "sink": "y", "bug_class": "authz", "potential_severity": "high"})
+        ocid = run("add", *L2, "--target", target, "--record", oos)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ocid,
+                         "--to", "out-of-scope", "--receipt", json.dumps({"reason": "meh"}))
+        check("severe out-of-scope without canonical link REFUSED (material)", rc == 3)
+        # a FAKE canonical string is not a preservation (gpt-5.6-sol fix #1)
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ocid,
+                         "--to", "duplicate", "--receipt", json.dumps({"reason": "dup", "canonical_finding": "F-nope"}))
+        check("severe duplicate citing a FAKE canonical REFUSED", rc == 3)
+        # a REAL, still-severe canonical candidate preserves the finding -> ACCEPTED
+        canon = json.dumps({"finding_sig": "sig-canon", "component": "c", "path": "parser.c",
+            "sink": "y", "bug_class": "authz", "potential_severity": "high"})
+        canid = run("add", *L2, "--target", target, "--record", canon)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ocid,
+                         "--to", "duplicate", "--receipt", json.dumps({"reason": "dup", "canonical_finding": canid}))
+        check("severe duplicate WITH a real severe canonical ACCEPTED (preserved)", rc == 0)
+
+        # CASE 7b: hardening — an UNHASHABLE path_id is refused, not crashed (gpt-5.6-sol new-issue)
+        sev2 = json.dumps({"finding_sig": "sig-crash", "component": "c", "path": "parser.c",
+            "sink": "z", "bug_class": "authz", "potential_severity": "critical"})
+        s2 = run("add", *L2, "--target", target, "--record", sev2)[1]["candidate_id"]
+        cd2 = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": s2, "verdict": "concur_downgrade"}))[1]["job_id"]
+        md_bad = conf("low"); md_bad["material_downgrade_receipt"] = {"negated_hypothesis": "n",
+            "consequence_trace": "t", "gating": {"build": "b"}, "independent_review": {"job_id": cd2},
+            "trigger_paths": [{"path_id": {"nope": 1}, "status": "tested", "observed": "x"}]}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", s2,
+                         "--to", "corrected", "--receipt", json.dumps(md_bad))
+        check("unhashable path_id REFUSED (no crash)", rc == 3 and
+              any("non-empty string" in e for e in out.get("errors", [])))
+        # CASE 7c: a downgrade citing a job bound to a DIFFERENT candidate is refused (no job reuse)
+        md_reuse = conf("low"); md_reuse["material_downgrade_receipt"] = {"negated_hypothesis": "n",
+            "consequence_trace": "t", "gating": {"build": "b"}, "independent_review": {"job_id": cd_job},  # cd_job targets rcid
+            "trigger_paths": [{"path_id": "p1", "status": "tested", "observed": "x"}]}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", s2,
+                         "--to", "corrected", "--receipt", json.dumps(md_reuse))
+        check("downgrade reusing another candidate's review job REFUSED", rc == 3 and
+              any("cannot be reused" in e for e in out.get("errors", [])))
+
+        # CASE 7d: Critical->Medium is a >=2-level drop => MATERIAL now (gpt-5.6-sol amendment: F-22 was
+        # capped Critical->Medium, which an effective-Low-only rule missed). No bundle -> REFUSED.
+        cm = json.dumps({"finding_sig": "sig-crit-med", "component": "c", "path": "parser.c",
+            "sink": "album membership write", "bug_class": "authz", "potential_severity": "critical"})
+        cmid = run("add", *L2, "--target", target, "--record", cm)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", cmid,
+                         "--to", "corrected", "--receipt", json.dumps(conf("medium")))
+        check("Critical->Medium (2-level) is material -> REFUSED without bundle", rc == 3 and
+              out.get("transition") == "REFUSED")
+
+        # CASE 7e: interpreter/process sink confirmed >=2 levels below its hwm needs sink_semantics
+        psqlf = json.dumps({"finding_sig": "sig-psql-conf", "component": "c", "path": "parser.c",
+            "sink": "psql <- uploaded content", "bug_class": "cwe-78", "potential_severity": "critical"})
+        pcid = run("add", *L2, "--target", target, "--record", psqlf)[1]["candidate_id"]
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", pcid,
+                         "--to", "confirmed", "--receipt", json.dumps(conf("medium")))  # no sink_semantics
+        check("interpreter-sink confirmed medium WITHOUT sink_semantics REFUSED", rc == 3 and
+              any("sink_semantics" in e for e in out.get("errors", [])))
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", pcid,
+                         "--to", "confirmed", "--receipt", json.dumps(conf("medium", ss=True)))
+        check("interpreter-sink confirmed medium WITH sink_semantics ACCEPTED", rc == 0 and
+              out.get("to") == "confirmed")
+
+        # CASE 7f: placeholder/stub candidate is REFUSED at add (invalid-cell lint; the B3 failure)
+        rc, out, err = run("add", *L2, "--target", target, "--record", json.dumps({
+            "finding_sig": "test", "component": "a", "sink": "f", "entry_point": "1"}))
+        check("placeholder candidate REFUSED at add", rc != 0 and "placeholder" in err.lower())
+
+        # CASE 7g: an INVARIANT-based kill without the all-writers challenge is REFUSED
+        iv = json.dumps({"finding_sig": "sig-inv", "component": "c", "path": "parser.c",
+            "sink": "group write", "bug_class": "authz"})
+        ivid = run("add", *L2, "--target", target, "--record", iv)[1]["candidate_id"]
+        ivjob = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": ivid, "verdict": "uphold"}))[1]["job_id"]
+        inv_reject = {"rejection_reason": "non-exploitable",
+            "counter_hypothesis": "duplicate groups are always single-owner so no cross-tenant write",
+            "vector_matrix": [{"vector": "body", "status": "tested", "command_or_fixture": "f", "observed": "scoped"}],
+            "independent_review": {"job_id": ivjob}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ivid, "--to", "rejected",
+                         "--receipt", json.dumps(inv_reject))
+        check("invariant kill without all_writers challenge REFUSED (F-07 guard)", rc == 3 and
+              any("all_writers" in e or "invariant_challenge" in e for e in out.get("errors", [])))
+
+        # CASE 7h: an EXPECTED-BEHAVIOR kill without a policy artifact is REFUSED ("a sibling does it" != intent)
+        eb = json.dumps({"finding_sig": "sig-eb", "component": "c", "path": "parser.c",
+            "sink": "mapUser email", "bug_class": "info-leak"})
+        ebid = run("add", *L2, "--target", target, "--record", eb)[1]["candidate_id"]
+        ebjob = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": ebid, "verdict": "uphold"}))[1]["job_id"]
+        eb_reject = {"rejection_reason": "expected-behavior",
+            "counter_hypothesis": "GET /users already returns email so this is intended baseline",
+            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "email present"}],
+            "independent_review": {"job_id": ebjob}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ebid, "--to", "rejected",
+                         "--receipt", json.dumps(eb_reject))
+        check("expected-behavior kill without policy_evidence REFUSED (F-18 guard)", rc == 3 and
+              any("policy_evidence" in e for e in out.get("errors", [])))
+
+        # CASE 7g2: a COMPLETE invariant challenge (substantive all_writers + mutation_paths + bool) ACCEPTED
+        iv2 = json.dumps({"finding_sig": "sig-inv2", "component": "c", "path": "parser.c", "sink": "grp", "bug_class": "authz"})
+        iv2id = run("add", *L2, "--target", target, "--record", iv2)[1]["candidate_id"]
+        iv2job = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": iv2id, "verdict": "uphold"}))[1]["job_id"]
+        inv_ok = {"rejection_reason": "non-exploitable",
+            "counter_hypothesis": "the group is always single-owner",
+            "invariant_challenge": {"invariant": "at most one owner per group",
+                "enforcement_site": "album-user.table.ts:20 unique index",
+                "all_writers": ["album.service.ts:128 create", "album.service.ts:336 updateUser",
+                                "asset.service.ts:130 updateAll duplicateId"],
+                "mutation_paths": ["PUT /assets {duplicateId}", "POST /duplicates/resolve"],
+                "counterexample_tested": True},
+            "vector_matrix": [{"vector": "body", "status": "tested", "command_or_fixture": "f", "observed": "index holds"}],
+            "independent_review": {"job_id": iv2job}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", iv2id, "--to", "rejected",
+                         "--receipt", json.dumps(inv_ok))
+        check("complete invariant-challenge rejection ACCEPTED", rc == 0 and out.get("to") == "rejected", out)
+
+        # CASE 7h2: a COMPLETE expected-behavior kill (policy artifact + quote) ACCEPTED
+        eb2 = json.dumps({"finding_sig": "sig-eb2", "component": "c", "path": "parser.c", "sink": "field", "bug_class": "info-leak"})
+        eb2id = run("add", *L2, "--target", target, "--record", eb2)[1]["candidate_id"]
+        eb2job = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": eb2id, "verdict": "uphold"}))[1]["job_id"]
+        eb_ok = {"rejection_reason": "expected-behavior", "counter_hypothesis": "documented public field",
+            "policy_evidence": {"artifact": "docs/api/privacy.md", "span_or_url": "privacy.md:44",
+                "quote": "the display name is a public profile field exposed to all authenticated users"},
+            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "name present"}],
+            "independent_review": {"job_id": eb2job}}
+        rc, out, _ = run("transition", *L2, "--target", target, "--candidate", eb2id, "--to", "rejected",
+                         "--receipt", json.dumps(eb_ok))
+        check("complete expected-behavior rejection ACCEPTED", rc == 0 and out.get("to") == "rejected", out)
+
+        # CASE 8: conformance catches DIRECT-EDIT laundering (severe->corrected-Low, no material receipt)
+        import json as _j
+        led_path = os.path.join(tmp, "out", "ledger2", "ledger.json")
+        with open(led_path) as f: raw = _j.load(f)
+        raw["candidates"][mcid]["potential_hwm"] = "critical"     # pretend it was a severe finding
+        raw["candidates"][mcid]["receipts"]["confirmation"]["receipt"]["effective_severity"] = "low"
+        raw["candidates"][mcid].pop("material_downgrade", None)
+        raw["candidates"][mcid]["receipts"].pop("material_downgrade", None)
+        with open(led_path, "w") as f: _j.dump(raw, f)
+        rc, out, _ = run("conformance", *L2)
+        check("conformance FLAGS a severe finding downgraded to Low without a receipt (anti-laundering)",
+              "severe_finding_downgraded_to_low_without_receipt" in out.get("failures", {}))
+
         print(f"\n{passed} passed, {failed} failed")
         return 1 if failed else 0
     finally:
