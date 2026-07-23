@@ -1,0 +1,15 @@
+{
+  "name": "raptor",
+  "owner": {
+    "name": "Nicolas Krassas"
+  },
+  "description": "RAPTOR security-research skills for Claude Code.",
+  "plugins": [
+    {
+      "name": "raptor-loop-hunt",
+      "source": "./",
+      "description": "Autonomous looping multi-altitude vulnerability hunt (generate -> judge -> verify).",
+      "version": "1.0.0"
+    }
+  ]
+}
