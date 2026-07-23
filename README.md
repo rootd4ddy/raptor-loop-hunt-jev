@@ -12,14 +12,21 @@ It triggers whenever you point Claude at source code and want vulnerabilities fo
 
 ## Install
 
-It's a skill — drop it into your Claude Code skills directory and it is discovered automatically:
+**As a plugin — no clone needed.** Add the marketplace and install; Claude Code fetches it for you:
+
+```
+/plugin marketplace add dinosn/raptor-loop-hunt
+/plugin install raptor-loop-hunt@raptor
+```
+
+Then `/reload-plugins` (or restart). The skill auto-triggers on audit requests, or invoke it directly.
+
+**Or drop it in as a personal skill** — clone into your Claude Code skills directory and it is
+discovered automatically on the next session:
 
 ```bash
 git clone https://github.com/dinosn/raptor-loop-hunt ~/.claude/skills/raptor-loop-hunt
 ```
-
-Claude Code picks it up on the next session. You can also vendor it into a plugin's `skills/`
-directory to ship it as part of a plugin.
 
 ## Use
 
