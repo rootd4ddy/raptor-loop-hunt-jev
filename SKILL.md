@@ -836,8 +836,8 @@ judge (and your live-verify) confirm it.
 
 **Split the roles by refusal-tolerance, not just capability.** The generator seat is high-recall
 and offensive by nature; a model that hedges or refuses offensive reasoning silently costs you
-recall. An **uncensored / abliterated local model** (run via RAPTOR's OLLAMA support) fits the
-*generator* seat well — it won't decline the reasoning and is cheap to fan out at N. Reserve the
+recall. A **permissive, locally-run model** fits the *generator* seat well — it won't decline the
+reasoning and is cheap to fan out at N. Reserve the
 frontier / cross-vendor model for the *judge and triage* seat, where refutation and precision are
 what matter. Recall model generates; precision model adjudicates.
 
