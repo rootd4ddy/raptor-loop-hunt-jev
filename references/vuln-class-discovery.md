@@ -137,6 +137,58 @@ This is the single most common false-negative in refute-mode, so it is a rule, n
   resource; or code proof the authorization is absent on a reachable path. Server-enforced ⇒ if the
   enforcing layer is unseen, `needs-live-validation`.
 
+## Policy–execution interpretation differential (check-view ≠ use-view)
+
+A security control and the privileged action it guards derive their decision from the **same**
+attacker-influenced identifier, but interpret it under **different** rules — case, exact-vs-prefix,
+type/namespace, decode order/count, or a different parser. The control's *view* of the identifier is
+narrower than the action's, so an input the control reads as "not privileged / not this resource" the
+action reads as "privileged / this resource." This class is a **static interpretation mismatch, not a TOCTOU
+race**, and not just "normalization" (it covers parser, prefix, and type-erasure cases too). If the witness requires the identifier or
+relevant state to change between check and use, classify it under TOCTOU instead.
+
+- **Source class:** any attacker-influenced identifier that feeds **both** a security decision and the
+  privileged operation it is meant to gate — a destination/URI/scheme/topic name, a resource/action
+  id, a clientId/subscription name, a role/path selector; including the second-order form (a stored
+  name later re-matched). No attacker influence over the identifier ⇒ no source ⇒ not this class
+  (e.g. admin-configured LDAP objectClass, bridge-internal config names).
+- **Sink class (by mechanism):** a privileged branch/dispatch (management op, admin action, routing to
+  another principal's resource, a denied scheme/loader, a store/adapter selection) whose
+  "should-I / is-this-that-resource?" boolean is a *recognizer* (allow/deny list, ACL match,
+  is-management/is-admin test) — **paired with a second recognizer over the same identifier inside the
+  action** (the real parser/dispatcher/store key).
+- **Violated invariant (subset relation):** for every reachable identifier,
+  `∀x: ActionTreatsAsPrivileged(x) ⇒ ControlCoversAsProtected(x)` — equivalently, the privileged-use
+  language is a **subset** of the control's protected language for the same typed identity and policy
+  context. Broken iff `∃x: ActionTreatsAsPrivileged(x) ∧ ¬ControlCoversAsProtected(x)`.
+- **Enumeration:** for every privileged/authz decision, extract the **matcher signature** of BOTH the
+  control and the action over the same identifier and diff them along: **case** (`equals` vs
+  `equalsIgnoreCase`/`regionMatches(true,…)`), **anchoring** (exact vs `startsWith`/`indexOf(x)==0`/
+  prefix/`contains`), **type/namespace** (typed resource vs bare-name), **decode** (raw vs URL/entity/
+  percent-decoded, and decode *order/count*), **parser** (the validator's parser vs the consumer's).
+  The deterministic sweep — an AST/taint-aware Semgrep or equivalent query for a security-relevant
+  boolean from `equalsIgnoreCase` / `regionMatches(true` / `startsWith` / `indexOf(x)==0` /
+  decoded-vs-raw guarding a privileged branch — is a **high-recall candidate generator, not the
+  detector**; plain grep is only a lexical seed, and the witness proves bugs.
+- **Suppress (not a finding) when:** both decisions consume the same typed canonical identity and no
+  later reparse, coercion, or reclassification widens the action; both consumers demonstrably implement
+  the same protocol/spec-defined identity rules; or the privileged-use language is a proven subset of
+  the controlled language for all reachable inputs under the actual configuration.
+- **Oracle:** a concrete differential **witness** `x` traced end-to-end — the control classifies it as
+  unprotected while the action classifies it as privileged; establish attacker control + preconditions
+  and test neighboring variants (case/type/prefix/decode). Add a regression/property test asserting the
+  subset invariant.
+- **Exemplars (ActiveMQ 5.19.6):** `BrokerView.validateAllowedUri` uses `URISupport.isCompositeURI` to
+  decide whether to inspect nested schemes; that predicate is paren-anchored, while
+  `SimpleDiscoveryAgentFactory` unconditionally uses `URISupport.parseComposite`, so `static:vm://…`
+  skips the nested-scheme control but emits the denied `vm` component downstream (CVE-2026-45505).
+  Chained with CVE-2026-42588's VM/XBean broker-creation sink and its management-access and payload
+  preconditions, this enabled authenticated code execution as the broker-process user.
+  `AuthorizationBroker.send` authorizes the submitted typed destination, while `SchedulerBroker`
+  recognizes a case-insensitive, type-agnostic physical-name prefix via `regionMatches(true,…)`; with
+  `schedulerSupport=true` and differing ACLs, a permitted `queue://ActiveMQ.Scheduler.Management` alias
+  reaches the global management branch even when the canonical topic is denied (authz bypass).
+
 ## Authentication, session & token integrity
 
 - **Source class:** any credential, token, session reference, or account-recovery selector under
