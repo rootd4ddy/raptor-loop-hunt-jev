@@ -185,6 +185,16 @@ LLM round and don't spend inference rediscovering what they already know:
   Semgrep hit is a **lead, not a finding**: it enters the same finding contract and the same
   from-raw judge as any LLM candidate. Keep Semgrep in the *generator* (recall) seat only — a
   pattern match never stands in for the judge.
+  - **Standing anchor — check-view ≠ use-view.** Beyond the per-boundary rules, always seed one anchor
+    for the *policy–execution interpretation differential* class (`references/vuln-class-discovery.md`):
+    a security-relevant boolean derived from `equalsIgnoreCase` / `regionMatches(true,…)` / `startsWith` /
+    `indexOf(x)==0` / a decode-then-match on a name/URI/id that **guards a privileged branch**. It is a
+    high-recall/high-noise candidate *generator*, never a detector: promote a hit only when a judge can
+    exhibit a witness `x` the control interpretation misses but the action interpretation accepts, and
+    suppress it when the identifier is not attacker-influenced or both consumers share one canonicalization.
+    (Both our own scheduler-alias false-negative and the CVE-2026-45505 RCE reduce to this class — and note
+    grep alone under-matches `regionMatches(true` and over-matches benign `equalsIgnoreCase`, so treat it as
+    an AST/taint-aware anchor, not a text scan.)
 
 ## Per-class discovery method (load when a bug-class lens is active)
 
@@ -794,6 +804,84 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   boundaries, and sinks — this seeds the whole-project and functionality altitudes.
 - **Sink-class sweeps:** `/understand --hunt <pattern>` per dangerous sink class (shell-exec,
   strcpy/format-string, crypto-compare, file-syscall, deserialization). One hunt per class.
+- **Semantic-invariant candidate source (opt-in, gated).** For bug classes whose violation has *no
+  adequate generic sink signature* — ownership transfer, lifetime/refcount, aliasing, RCU/lock-protected
+  lifetime, one-shot state transitions, omitted-cleanup contracts — the sink sweeps above are not
+  sufficient. `/understand --study` learns the target's own invariants; use it only to seed candidate
+  generation, never as detection, confirmation, refutation, or coverage.
+
+  **Gate hard.** Run at most one prep+run pipeline per engagement — no `raptor-study-loop` and no
+  reading-list follow-up — and only when ALL hold: (1) C/C++ target; (2) pre-map has selected one
+  explicit, bounded hot scope: a single file or strict-descendant subsystem directory whose canonical
+  path and selection reason are recorded in `TRIED.md`, never the target/repository root, a union of
+  disconnected directories, a dependency excluded by the deterministic layer, or an unbounded fan-out;
+  (3) the active round lens is ownership / lifetime / aliasing / refcount / RCU or lock-protected
+  lifetime / state-machine / cleanup-contract; (4) that scope has a structural signal matching the
+  active lens — paired lifetime operations (get/put, alloc/free), a refcount field, the same resource
+  stored in multiple owners, an async/callback handoff, RCU or locking primitives around the resource,
+  an explicit state field/enum with cross-function transitions or gates, or a multi-function
+  cleanup/unwind contract; (5) budget remains for a full generate → judge → live-verify pass on every
+  lead it yields; and (6) no study pass has already been recorded for this engagement's exact target
+  identity and scope. A pathname or mtime does not establish freshness: reuse an existing model only
+  when a loop-owned record binds it to the same canonical target root, commit plus dirty-tree digest,
+  and hot scope; otherwise ignore it and use the engagement's single allowed pass. If any gate fails,
+  skip. It is not worth the cost for injection, format-string, path-traversal, known-CVE variants, small
+  idiomatic subsystems, Rust, or C++ whose ownership is already mechanically encoded by idiomatic RAII.
+
+  **Invocation.** There is no `/understand --study` dispatcher flag; drive the libexecs directly from a
+  RAPTOR-launched trusted session into a unique, loop-owned study directory outside the target tree —
+  never the `/audit` output directory, and do not give it an `understand_*` name:
+  ```bash
+  STUDY_DIR="$(mktemp -d "$OUTPUT_DIR/study-memory.XXXXXX")"
+
+  env SAGE_ENABLED=false \
+      "$RAPTOR_DIR/libexec/raptor-study-prep" \
+      "<hot-subsystem>" "$STUDY_DIR" \
+      --root "<target-root>" --concept "<active-lens-concepts>"
+
+  env SAGE_ENABLED=false \
+      "$RAPTOR_DIR/libexec/raptor-study-run" \
+      "$STUDY_DIR" --model "<study-model>"
+  ```
+  Here `<target-root>` is the canonical source root used for include resolution, not the hot-subsystem
+  path, and `<active-lens-concepts>` is a comma-separated list limited to the active lens. The scripts
+  parse prep as `<target> <output_dir>`, with `--root` and `--concept` on prep, and parse `--model` on
+  run. Do not bypass their `CLAUDECODE` / `_RAPTOR_TRUSTED` guard merely to make the commands run.
+  `SAGE_ENABLED=false` is load-bearing: directory isolation alone does not prevent study from recalling,
+  seeding, or skipping from cross-run SAGE memory. If either command fails, `domain-model.json` is
+  missing or malformed, or its resolved `target` / `source_root` does not match the requested hot scope
+  / target root, consume nothing; partial study output is not a lead. Record the target identity, scope,
+  and `$STUDY_DIR` in `TRIED.md` as a non-coverage generator attempt.
+
+  Read `domain-model.json` yourself. Do **not** rely on `/audit` picking it up: the intended
+  free-via-`/audit` path is dead code in the current RAPTOR checkout, nothing imports this model into
+  loop-hunt automatically, and the dormant bridge is unsafe to enable because an `inferred` invariant
+  can bypass `/audit`'s tool-evidence gate. That is why this model remains isolated and may feed only
+  the candidate-source seat below.
+
+  **Consumption.** Import no model claim directly. For each invariant, resolve `invariant.concept` to
+  its `concepts[]` entry — citeable evidence is not reliably carried on the invariant itself in the
+  current schema. Keep only invariants whose confidence is exactly `traced`, `corroborated`, or `tested`
+  (discard `inferred`, `documented`, and unknown labels) and whose referenced concept has at least two
+  distinct, current, in-scope source `file:line` citations. Re-open every cited span against the current
+  tree; discard missing, out-of-root, stale/hash-mismatched, doc-only, or non-source citations. A
+  confidence label is not evidence.
+
+  Each survivor is still only a hypothesis-selection hint. The model reader may use it to locate neutral
+  raw-source spans where enforcement may be omitted; then a fresh, isolated loop generator receives only
+  those raw spans plus the ordinary active lens and must independently re-derive both the invariant and
+  a violating path before anything crosses into loop-hunt. Any study-derived lead that crosses that
+  boundary imports only as an **`open` candidate** with raw-source locations and runs the full
+  generate → judge → live-verify chain. The independent from-raw judge receives sufficient raw source
+  and call-path context, but never the domain-model statement, negation, description, evidence
+  observations, ID, confidence, role, model-selected conclusion, or generator summary.
+
+  Model content — including a `role="guard"` invariant — may never confirm, downgrade, reject,
+  deduplicate, or suppress a candidate. Finding enforcement in one path does not refute omission in
+  another; absence from the model proves nothing; an empty or failed study proves nothing. Study may add
+  or prioritise candidates, never suppress a component, path, candidate, or bug class. No study run,
+  invariant, negative search, or imported lead is coverage evidence or a disposition receipt.
+  **Incremental recall is not yet demonstrated — treat it as an experimental candidate source.**
 - **Function-altitude generator:** `/audit <target>` works over its own checklist-derived gap
   set — the functions with no prior coverage record and no `checked_by` marker, after scope,
   strategy and budget filters. (Scanner file-coverage shifts *priority* in that set; it is not
@@ -930,6 +1018,20 @@ judge. A model tends to rationalize the plausible-but-wrong findings its own fam
 an outside vendor doesn't share those blind spots, so cross-vendor judging is the strongest
 verification config available. Treat any cross-model "I found a bug" as a hypothesis until the
 judge (and your live-verify) confirm it.
+
+**Standing judge sub-question — interpretation-differential (do NOT skip it on a "design-intended" kill).**
+Whenever a control gates a privileged action off an attacker-influenced identifier, the judge must ask:
+*do the control and the action identify the same canonical resource under compatible equivalence relations,
+and is the privileged-use language a **subset** of the controlled language?* Compare the exact matching
+signature each side uses (case, exact-vs-prefix, type/namespace, decode order/count, parser). A looser
+action-side match than the control-side match is a bypass **even when the control itself is "correctly
+ACL-gated"** — this is exactly how a real scheduler-management **alias** authz bypass was mis-refuted as
+"design-intended" by judging only the canonical path. Corollary: **a refutation closes the *claim*, not the
+*site*** — when a finding is rejected, its cited `file:line` re-enters the generate pool under this and other
+lenses before it is marked done, and a KB recheck of a prior rejection must **re-frame** (ask a new question),
+not re-run the same judge question that produced the old (narrow) answer. The differential-witness oracle
+(a concrete `x` traced end-to-end + a regression test on the subset invariant) is what promotes it to
+`confirmed`; the preferred fix to recommend is one typed canonical identity shared by policy and dispatch.
 
 **Split the roles by refusal-tolerance, not just capability.** The generator seat is high-recall
 and offensive by nature; a model that hedges or refuses offensive reasoning silently costs you
