@@ -749,8 +749,18 @@ resolve to a ledger fact or a receipt, and surface every mismatch:
 - report claims (reachable / default-config / PoC-reproduces / component-covered / vector-tested /
   cross-vendor-decided)  −  the matching log/receipt facts  → a claim with no evidence behind it.
 
-Any non-empty diff is a **gate failure**, not an advisory: the report does not ship until the diff
-is empty or the residue is stated as an explicit caveat. **Verify coverage and rejection claims,
+Any non-empty diff is a **gate failure**, not an advisory. There is no "PASS with residue" — that
+wording is forbidden, and the gate cannot emit it. The verdict vocabulary is exactly three values:
+
+- **`PASS`** — every mandatory check executed and every diff is empty. Only this may be called final.
+- **`PARTIAL`** — no known contradiction, but a mandatory check was skipped or its inputs were
+  incomplete. Not a pass. A report rendered here is labelled **INTERIM** in its own header.
+- **`FAIL`** — at least one check found a contradiction. Stays `FAIL` even when the run is
+  deliberately interim; an interim disclosure never launders a known failure into a softer word.
+
+A failed or partial gate does **not** embargo an actionable confirmed finding — disclose it, under a
+header that carries the real verdict and names the outstanding work. What it forbids is a report that
+*reads as complete* while the machine state says otherwise. **Verify coverage and rejection claims,
 not only the `confirmed` ones** — those are the more dangerous claims because they *suppress*
 further work (a wrongly-"covered" module and a wrongly-"rejected" bug both end the search). The
 comparison is machine set-difference over the ledger, not model interpretation; an independent

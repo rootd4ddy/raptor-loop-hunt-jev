@@ -66,6 +66,8 @@ ORACLE_CLASSES = {
 REJECT_REASONS = {"unreachable", "non-exploitable", "expected-behavior", "duplicate", "out-of-scope"}
 DELIVERY_VECTORS = {"path", "query", "body", "cookie", "header", "enc-request", "cli", "env", "config", "other"}
 VECTOR_STATUS = {"tested", "not-applicable"}
+# a live_validation closes only by RESOLVING the unknown one way or the other (or naming its blocker)
+LIVE_OUTCOMES = {"vulnerable", "safe", "inconclusive"}
 # uphold/overturn/inconclusive judge a rejection; concur_downgrade concurs with a *material downgrade*
 # of a severe finding to Low (see the material-downgrade gate). A downgrade may cite only concur_downgrade.
 REVIEW_VERDICTS = {"uphold", "overturn", "inconclusive", "concur_downgrade"}
@@ -300,8 +302,32 @@ def _read_json_arg(record, file_or_dash) -> dict:
 def compute_identity(target: Path) -> dict:
     real = os.path.realpath(target)
     return {"target_path_id": _sha(real.encode())[:16],
+            "target_path": real,
             "vcs_commit": _run_git(target, "rev-parse", "HEAD").strip(),
+            # a VCS target whose commit we could resolve is bindable; a plain source drop is not.
+            # Recording WHY lets conformance tell "no commits exist here" apart from "we lost it".
+            "commit_bindable": bool((Path(real) / ".git").exists()),
             "release_label": _run_git(target, "describe", "--tags", "--always").strip()}
+
+
+def _assert_target_matches(led: dict, target: str) -> None:
+    """Every write must name the SAME tree the ledger was initialised for.
+
+    Observed failure this prevents: in a real engagement the ledger was initialised against one
+    path while the KB was given the actual repo, so the ledger's identity carried an empty commit
+    and ALL 56 receipts were written with `certified_commit: ""`. Nothing noticed for days, because
+    the mismatch was only ever detectable at closure — by which time the evidence is already
+    unbindable. Catch it at the write, not at the gate."""
+    want = (led.get("target_identity") or {}).get("target_path_id", "")
+    if not want:
+        return
+    got = _sha(os.path.realpath(target).encode())[:16]
+    if got != want:
+        raise SystemExit(
+            f"ledger: --target resolves to {got} but this ledger was initialised for {want}. "
+            f"Refusing to mix trees in one engagement — receipts written against a different path "
+            f"cannot be certified against the audited one. Point --target at the initialised tree, "
+            f"or start a new ledger for the new target.")
 
 
 # ============================ id helpers =======================================
@@ -313,7 +339,8 @@ def _candidate_id(rec: dict) -> str:
 
 def _job_id(job: dict) -> str:
     key = "|".join(str(job.get(k, "")) for k in
-                   ("model", "target", "verdict", "evidence_hash", "dispatched_at"))
+                   ("model", "vendor", "target", "verdict", "evidence_hash",
+                    "dispatched_at", "dispatched_by"))
     return "J-" + _sha(key.encode())[:12]
 
 
@@ -351,6 +378,24 @@ def _validate_confirmation(receipt: dict, bug_class: str) -> tuple[bool, list]:
     return (not errs, errs)
 
 
+def _review_job_binds_candidate(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    """A cross-vendor review must be about THIS candidate. Without this, one `uphold` job can be
+    cited by every rejection in the run — the material-downgrade path already checked candidate
+    binding; the rejection path did not (gpt-5.6-sol review of this change)."""
+    ir = receipt.get("independent_review")
+    if not isinstance(ir, dict):
+        return (True, [])          # absence is already reported by _validate_rejection
+    job = led.get("cross_vendor_jobs", {}).get(ir.get("job_id"))
+    if not isinstance(job, dict) or cand is None:
+        return (True, [])          # existence is already reported by _validate_rejection
+    tgt = str(job.get("target", ""))
+    if tgt and tgt not in (cand.get("candidate_id", ""), cand.get("finding_sig", "")):
+        return (False, [f"cross-vendor job {ir.get('job_id')} reviewed {tgt!r}, not this candidate "
+                        f"({cand.get('candidate_id')} / {cand.get('finding_sig')!r}) — a review of a "
+                        "different finding is not a review of this one"])
+    return (True, [])
+
+
 def _validate_rejection(receipt: dict, ledger: dict) -> tuple[bool, list]:
     errs = []
     reason = receipt.get("rejection_reason")
@@ -361,8 +406,25 @@ def _validate_rejection(receipt: dict, ledger: dict) -> tuple[bool, list]:
     vm = receipt.get("vector_matrix")
     if not isinstance(vm, list) or not vm:
         errs.append("vector_matrix must be a non-empty list; a bare vector list proves no test ran")
+    elif len(vm) > MAX_LIST_LEN:
+        errs.append(f"vector_matrix has {len(vm)} rows; cap is {MAX_LIST_LEN}")
     else:
-        for i, row in enumerate(vm[:MAX_LIST_LEN]):
+        # COMPLETENESS, not merely non-emptiness. SKILL.md ("A REJECTION carries the finding's full
+        # proof burden") demands the barrier hold on ALL of the sink's input sources. A vector that
+        # is silently absent is the canonical false-kill shape: the kill tested the URL path only,
+        # and the query-param vector executed live. So every vector is stated explicitly — `tested`
+        # with evidence, or `not-applicable` with a rationale. Unexamined ⇒ unknown, never absent.
+        seen = [row.get("vector") for row in vm if isinstance(row, dict)]
+        missing = sorted(DELIVERY_VECTORS - set(seen))
+        dupes = sorted({v for v in seen if v in DELIVERY_VECTORS and seen.count(v) > 1})
+        if missing:
+            errs.append(f"vector_matrix is INCOMPLETE — no row for {missing}. Every delivery vector "
+                        f"needs an explicit disposition: `tested` (command_or_fixture + observed) or "
+                        f"`not-applicable` (rationale). A missing row is an untested vector sold as a "
+                        f"complete kill — the exact single-vector refutation this gate exists to stop.")
+        if dupes:
+            errs.append(f"vector_matrix has duplicate rows for {dupes}; exactly one row per vector")
+        for i, row in enumerate(vm):
             if not isinstance(row, dict):
                 errs.append(f"vector_matrix[{i}] must be an object"); continue
             v = row.get("vector")
@@ -487,6 +549,7 @@ def cmd_init(args) -> int:
 
 def cmd_add(args) -> int:
     root = _ensure_root(args.ledger, args.target)
+    _assert_target_matches(_load(root), args.target)
     rec = _read_json_arg(args.record, args.file)
     if not str(rec.get("finding_sig", "")).strip():
         raise SystemExit("ledger add: record.finding_sig required (stable candidate signature)")
@@ -547,17 +610,39 @@ def cmd_cross_vendor(args) -> int:
         raise SystemExit("ledger cross-vendor: model required (the reviewing model id)")
     if not str(job.get("target", "")).strip():
         raise SystemExit("ledger cross-vendor: target required (candidate_id or finding_sig under review)")
+    # HONEST SCOPE (gpt-5.6-sol): nothing inside a single-process CLI can PROVE a second vendor
+    # produced this verdict — vendor/model/hash all arrive as caller JSON. What these fields buy is
+    # *recorded provenance*: the reviewing vendor is named and distinguishable from the model label,
+    # and the review is bound to the evidence it read. Call it orchestrator-recorded review
+    # provenance, never "cross-vendor authentication". Real authentication needs a provider-signed
+    # response from a trust domain the CLI does not control.
+    if not str(job.get("vendor", "")).strip():
+        raise SystemExit("ledger cross-vendor: vendor required (the REVIEWING vendor, distinct from "
+                         "the model label — 'kimi-judge-J1' names a seat, not a vendor)")
+    if not str(job.get("evidence_hash", "")).strip():
+        raise SystemExit("ledger cross-vendor: evidence_hash required (a digest over the exact "
+                         "evidence the reviewer read; an unbound verdict reviews nothing)")
+    if not str(job.get("dispatched_by", "")).strip():
+        raise SystemExit("ledger cross-vendor: dispatched_by required — it must be stated, never "
+                         "defaulted (it previously defaulted to the literal 'orchestrator', so the "
+                         "field meant to evidence orchestrator dispatch asserted it by itself)")
     job.setdefault("dispatched_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())))
     jid = _job_id(job)
     rec = {"job_id": jid, "model": _cap(job.get("model", ""), 64),
+           "vendor": _cap(job.get("vendor", ""), 64),
            "target": _cap(job.get("target", ""), 128), "verdict": verdict,
            "evidence_hash": _cap(job.get("evidence_hash", ""), 128),
            "dispatched_at": _cap(job.get("dispatched_at", ""), 40),
-           "dispatched_by": _cap(job.get("dispatched_by", "orchestrator"), 64)}
+           "dispatched_by": _cap(job.get("dispatched_by", ""), 64)}
     with _Lock(root):
         led = _load(root)
         if len(led["cross_vendor_jobs"]) >= MAX_JOBS:
             raise SystemExit("ledger: cross-vendor job cap reached; refusing")
+        # jobs are IMMUTABLE: an id collision must not silently rewrite a recorded verdict
+        prev = led["cross_vendor_jobs"].get(jid)
+        if prev is not None and prev != rec:
+            raise SystemExit(f"ledger cross-vendor: job {jid} already recorded with different "
+                             "content; review jobs are immutable")
         led["cross_vendor_jobs"][jid] = rec
         led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
         _atomic_write(root, led)
@@ -748,6 +833,7 @@ def _validate_material_downgrade(receipt: dict, led: dict, cand: dict) -> tuple[
 
 def cmd_transition(args) -> int:
     root = _ensure_root(args.ledger, args.target)
+    _assert_target_matches(_load(root), args.target)
     to = args.to
     if to not in ALL_STATES:
         raise SystemExit(f"ledger transition: --to must be one of {sorted(ALL_STATES)}; got {to!r}")
@@ -769,6 +855,8 @@ def cmd_transition(args) -> int:
             kind = "confirmation"
         elif to == "rejected":
             ok, errs = _validate_rejection(receipt, led)
+            bok, berrs = _review_job_binds_candidate(receipt, led, cand)
+            ok, errs = (ok and bok), errs + berrs
             kind = "rejection"
         elif to == "needs-live-validation":
             ok, errs = _validate_needs_live(receipt)
@@ -804,6 +892,12 @@ def cmd_transition(args) -> int:
         # ACCEPTED. Record receipt + transition + auto-enqueue PENDING follow-ups.
         rid = _receipt_id(args.candidate, to, receipt)
         certified_commit = _cap(_run_git(Path(args.target), "rev-parse", "HEAD").strip(), 64)
+        if not certified_commit and (led.get("target_identity") or {}).get("commit_bindable"):
+            raise SystemExit(
+                "ledger transition: target is a git worktree but HEAD would not resolve, so this "
+                "receipt would be written with an empty certified_commit — unbindable to any tree, "
+                "and therefore unable to ever prove it was certified against the audited code. "
+                "Fix the worktree before recording the disposition.")
         cand["receipts"][kind] = {"receipt_id": rid, "at": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
             "certified_commit": certified_commit, "receipt": receipt}
@@ -815,6 +909,24 @@ def cmd_transition(args) -> int:
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))})
         prev = cand["state"]
         cand["state"] = to
+
+        # A bundle-completion action exists because an EARLIER attempt at this transition was
+        # refused for an incomplete receipt. Landing the transition with a receipt that passes the
+        # full gate IS the completion — reconcile it here rather than making the operator close the
+        # same work twice. Unreconciled duplicates were pure ceremony, and ceremony is what drives
+        # operators to bypass the ledger entirely (gpt-5.6-sol adoption-friction review).
+        reconciled = []
+        _RECONCILE = {"rejected": "complete_rejection_bundle"}
+        for a in led["pending_actions"]:
+            if a.get("state") == "completed" or a.get("target") != args.candidate:
+                continue
+            req = a.get("required_action")
+            if req == _RECONCILE.get(to) or (
+                    req == "complete_material_downgrade_bundle" and "material_downgrade" in cand["receipts"]):
+                a["state"] = "completed"
+                a["completion_receipt"] = {"receipt_id": rid, "receipt": {"reconciled_by_transition": to},
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))}
+                reconciled.append(a["action_id"])
 
         enqueued = []
         if to in ("confirmed", "corrected"):
@@ -829,8 +941,72 @@ def cmd_transition(args) -> int:
         _atomic_write(root, led)
     print(json.dumps({"transition": "ACCEPTED", "candidate_id": args.candidate,
                       "from": prev, "to": to, "receipt_id": rid,
-                      "pending_enqueued": enqueued}, indent=2))
+                      "pending_enqueued": enqueued,
+                      "pending_reconciled": reconciled}, indent=2))
     return 0
+
+
+def _validate_enumerate_trigger_paths(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    # the discovered paths must MECHANICALLY include the sink's callers/routes/dispatchers/loaders
+    # (gpt-5.6-sol review, missing #1: fixes the mis-scoped re-sweep that silently omits files).
+    errs = []
+    if not str(receipt.get("enumeration_recipe", "")).strip():
+        errs.append("enumeration_recipe required (the route/reference/dispatcher/loader searches "
+                    "run to establish the path set — not a manually chosen file list)")
+    paths = receipt.get("trigger_paths")
+    if not isinstance(paths, list) or not paths:
+        errs.append("trigger_paths required: every statically-discoverable distinct ingress to "
+                    "the sink, each with a status (tested/static-cleared/needs-live/needs-review)")
+    return (not errs, errs)
+
+
+def _validate_live_validation(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    """A server-dependent finding's live test. Previously this closed on `{}` — the single widest
+    fail-open in the gate: three of these were closed with no evidence at all and conformance then
+    returned PASS. A live validation that resolves nothing does not close the action; it must say
+    what it OBSERVED and which way the predicate went."""
+    errs = []
+    outcome = receipt.get("outcome")
+    if outcome not in LIVE_OUTCOMES:
+        errs.append(f"outcome required, one of {sorted(LIVE_OUTCOMES)} — a live validation exists to "
+                    "RESOLVE the unknown; closing it without a verdict re-buries it")
+    if not str(receipt.get("observation", "")).strip():
+        errs.append("observation required (what the test actually showed, not what you expected)")
+    arts = receipt.get("artifacts")
+    if not isinstance(arts, list) or not [a for a in arts if str(a).strip()]:
+        errs.append("artifacts required: the log/capture/response the observation was read from")
+    if not str(receipt.get("build_digest", "")).strip():
+        errs.append("build_digest required (WHAT you tested against — an image digest/commit; a "
+                    "result against an unrecorded build cannot be tied back to the reviewed tree)")
+    if outcome == "inconclusive" and not str(receipt.get("blocker", "")).strip():
+        errs.append("outcome=inconclusive requires `blocker` (what prevented resolution) — and the "
+                    "candidate stays needs-live-validation, which the closure gate will block on")
+    return (not errs, errs)
+
+
+def _validate_rejection_bundle(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    ok, errs = _validate_rejection(receipt, led)
+    if cand is not None:
+        ok2, errs2 = _review_job_binds_candidate(receipt, led, cand)
+        ok, errs = (ok and ok2), errs + errs2
+    return (ok, errs)
+
+
+def _validate_material_downgrade_bundle(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
+    if cand is None:
+        return (False, ["material-downgrade bundle needs a resolvable target candidate"])
+    return _validate_material_downgrade({"material_downgrade_receipt": receipt}, led, cand)
+
+
+# Default-deny: every required_action MUST map to a validator. An action type with no validator is
+# REFUSED, not waved through — the old code validated two of five and let the rest close on `{}`.
+PENDING_VALIDATORS = {
+    "dirty_sweep": lambda r, l, c: _validate_dirty_sweep(r),
+    "enumerate_trigger_paths": _validate_enumerate_trigger_paths,
+    "live_validation": _validate_live_validation,
+    "complete_rejection_bundle": _validate_rejection_bundle,
+    "complete_material_downgrade_bundle": _validate_material_downgrade_bundle,
+}
 
 
 def cmd_pending_complete(args) -> int:
@@ -841,30 +1017,27 @@ def cmd_pending_complete(args) -> int:
         action = next((a for a in led["pending_actions"] if a.get("action_id") == args.action), None)
         if action is None:
             raise SystemExit(f"ledger pending-complete: unknown action {args.action!r}")
-        # a dirty_sweep completion must carry a valid sweep receipt
-        if action.get("required_action") == "dirty_sweep":
-            ok, errs = _validate_dirty_sweep(receipt)
-            if not ok:
-                print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
-                                  "errors": errs}, indent=2))
-                return 3
-        # a trigger-path enumeration closes only with the inventory + how the scope was derived —
-        # the discovered paths must MECHANICALLY include the sink's callers/routes/dispatchers/loaders
-        # (gpt-5.6-sol review, missing #1: fixes the mis-scoped re-sweep that silently omits files).
-        if action.get("required_action") == "enumerate_trigger_paths":
-            paths = receipt.get("trigger_paths")
-            recipe = str(receipt.get("enumeration_recipe", "")).strip()
-            errs = []
-            if not recipe:
-                errs.append("enumeration_recipe required (the route/reference/dispatcher/loader searches "
-                            "run to establish the path set — not a manually chosen file list)")
-            if not isinstance(paths, list) or not paths:
-                errs.append("trigger_paths required: every statically-discoverable distinct ingress to "
-                            "the sink, each with a status (tested/static-cleared/needs-live/needs-review)")
-            if errs:
-                print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
-                                  "errors": errs}, indent=2))
-                return 3
+        # completion is IMMUTABLE — re-completing would let a valid receipt be overwritten by a
+        # weaker one after the fact (gpt-5.6-sol review of this change).
+        if action.get("state") == "completed":
+            print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
+                              "errors": ["action already completed; completion receipts are immutable"]},
+                             indent=2))
+            return 3
+        req = action.get("required_action")
+        validator = PENDING_VALIDATORS.get(req)
+        if validator is None:
+            print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
+                              "errors": [f"no validator registered for required_action {req!r}; "
+                                         "an unvalidated action type cannot be closed (default-deny)"]},
+                             indent=2))
+            return 3
+        cand = led["candidates"].get(action.get("target"))
+        ok, errs = validator(receipt, led, cand)
+        if not ok:
+            print(json.dumps({"pending_complete": "REFUSED", "action_id": args.action,
+                              "errors": errs}, indent=2))
+            return 3
         rid = _receipt_id(action["target"], "pending:" + action["required_action"], receipt)
         action["state"] = "completed"
         action["completion_receipt"] = {"receipt_id": rid, "receipt": receipt,
@@ -959,34 +1132,83 @@ def _candidate_by_ref(led: dict, ref: str):
 def cmd_conformance(args) -> int:
     """The deterministic closure gate: treat the finished run as a set of claims, each of
     which must resolve to a ledger fact or a receipt. Machine set-difference, NOT a model
-    self-audit. Any non-empty diff is a gate FAILURE (exit 3)."""
+    self-audit.
+
+    FAIL-CLOSED. A check whose inputs were not supplied does NOT silently pass: it lands in
+    `checks_skipped` with a reason and caps the verdict at PARTIAL. `checks_executed` is built from
+    the branches that actually ran — it was previously a hardcoded six-element list printed
+    regardless, so a bare invocation attested to three checks it never performed.
+
+    Verdicts: PASS (all checks ran, all diffs empty) / PARTIAL (nothing contradicted, but a
+    mandatory check was skipped) / FAIL (a check found a contradiction). Only PASS exits 0.
+    A known failure stays FAIL — there is no flag that renames it to something softer."""
     root = assert_safe_ledger_root(Path(args.ledger), None)
     led = _load(root)
     failures = {}   # check -> list of offending items
+    executed, skipped = [], []
 
     def fail(check, items):
         if items:
             failures[check] = items
+
+    def skip(check, why):
+        skipped.append({"check": check, "reason": why})
 
     # (1) coverage completeness: every inventory component covered or explicitly omitted.
     if args.inventory:
         inv = set(_read_component_lines(args.inventory))
         covered = set(_read_component_lines(args.covered)) if args.covered else set()
         omitted = set(_read_component_lines(args.omitted)) if args.omitted else set()
+        # an empty denominator makes every set-difference vacuously empty — a coverage claim over
+        # nothing is not a coverage claim (gpt-5.6-sol review of this change).
+        if not inv:
+            fail("coverage_inventory_empty",
+                 ["--inventory resolved to zero components; an empty denominator makes the coverage "
+                  "diff vacuously empty and would report full coverage of nothing"])
         fail("uncovered_components_implied_done", sorted(inv - covered - omitted))
         # a component claimed covered that isn't in the inventory is a bookkeeping error
         fail("covered_not_in_inventory", sorted(covered - inv))
+        executed.append("coverage")
+    else:
+        skip("coverage", "--inventory not supplied — component coverage was NOT verified; this is "
+                         "the axis that proves no module was silently skipped")
+
+    # (0) the ledger was actually used. A run with no candidates and no target identity is not a
+    # clean hunt, it is a hunt that never recorded anything — the observed real-world failure is an
+    # engagement whose ledger/ directory was simply left empty while the report read as finished.
+    # Vacuous set-differences must never certify that.
+    if not led["candidates"]:
+        fail("empty_ledger_no_hunt_recorded",
+             ["the ledger holds zero candidates; a run that recorded no candidate cannot be "
+              "certified closed — every check below is vacuously satisfied by absence"])
+    if not (led.get("target_identity") or {}).get("target_path_id"):
+        fail("ledger_never_initialised",
+             ["no target_identity — run `init --target <dir>` so receipts bind to a known tree"])
+    executed.append("ledger_used")
 
     # (2) ledger integrity: a terminal state MUST carry its receipt (guards direct edits
     # that bypass the transition gate).
-    missing_receipt, unswept = [], []
+    missing_receipt, unswept, bad_state, stale_receipt_content = [], [], [], []
     for cid, c in led["candidates"].items():
         st = c.get("state")
         rcpts = c.get("receipts", {})
+        # an unknown state evades every terminal/open test below — a direct edit to "reviewed" or
+        # "done" would otherwise sail through (gpt-5.6-sol review of this change).
+        if st not in ALL_STATES:
+            bad_state.append(f"{cid}:unknown-state:{st!r}")
         if st in ("confirmed", "corrected") and "confirmation" not in rcpts:
             missing_receipt.append(f"{cid}:{st}:no-confirmation-receipt")
         if st == "rejected" and "rejection" not in rcpts:
             missing_receipt.append(f"{cid}:{st}:no-rejection-receipt")
+        # RE-VALIDATE the stored receipt, don't just check the key exists. Presence-only checking is
+        # what let a direct edit — or a receipt written under an older, weaker contract — keep a
+        # terminal state it could no longer earn today (gpt-5.6-sol: "missing blocker #1").
+        if st == "rejected" and "rejection" in rcpts:
+            stored = (rcpts.get("rejection") or {}).get("receipt") or {}
+            rok, rerrs = _validate_rejection(stored, led)
+            bok, berrs = _review_job_binds_candidate(stored, led, c)
+            if not (rok and bok):
+                stale_receipt_content.append(f"{cid}:rejection-receipt-invalid:{'; '.join(rerrs + berrs)[:220]}")
         # a confirmed proven-dirty file needs a completed sweep OR an open pending (never silently none)
         if st in ("confirmed", "corrected") and (c.get("bug_class", "").lower() in DIRTY_BUG_CLASSES):
             aid = _action_id(cid, "dirty_sweep")
@@ -995,11 +1217,36 @@ def cmd_conformance(args) -> int:
                 unswept.append(f"{cid}:dirty-class-confirmed-with-no-sweep-action")
     fail("terminal_state_missing_receipt", missing_receipt)
     fail("dirty_confirmed_without_sweep", unswept)
+    fail("candidate_in_unknown_state", bad_state)
+    fail("stored_receipt_fails_current_contract", stale_receipt_content)
+    executed.append("ledger_integrity")
+
+    # (2b) NON-TERMINAL candidates block closure. SKILL.md promises the diff "candidate ledger −
+    # candidates with a terminal or explicitly-pending disposition"; it was never implemented, so a
+    # candidate sitting at `open` or `needs-live-validation` was invisible to the gate and the run
+    # could report as closed with unfinished candidates in it. needs-live-validation counts: it is a
+    # first-class outcome DURING the hunt, but an unresolved one at closure is exactly the
+    # "dropped pending/inconclusive" fraud class.
+    nonterminal = sorted(f"{cid}:{c.get('state')}" for cid, c in led["candidates"].items()
+                         if c.get("state") in STATES_OPEN)
+    fail("nonterminal_candidates_block_closure", nonterminal)
+    executed.append("candidate_closure")
 
     # (3) open pendings block the report.
     open_pending = [f"{a['action_id']}:{a['required_action']}->{a['target']}"
                     for a in led["pending_actions"] if a.get("state") != "completed"]
     fail("open_pending_actions_block_report", open_pending)
+    executed.append("pending")
+
+    # (3a) review-provenance hygiene: a job with no bound evidence or no named vendor cannot
+    # substantiate the kill/downgrade that cites it. Legacy jobs (written before these fields were
+    # required) surface here rather than silently counting as independent review.
+    unbound_jobs = sorted(
+        f"{jid}:{'no-evidence_hash' if not str(j.get('evidence_hash','')).strip() else 'no-vendor'}"
+        for jid, j in led.get("cross_vendor_jobs", {}).items()
+        if not str(j.get("evidence_hash", "")).strip() or not str(j.get("vendor", "")).strip())
+    fail("unauthenticated_review_jobs", unbound_jobs)
+    executed.append("review_provenance")
 
     # (3b) material-downgrade laundering: a severe (>=HIGH high-water-mark) finding that landed at an
     # effective-Low TERMINAL state must carry a material_downgrade receipt. Catches a High->Low re-rate
@@ -1028,18 +1275,47 @@ def cmd_conformance(args) -> int:
             laundered.append(f"{cid}:hwm={c.get('potential_hwm') or c.get('potential_severity')}->{st}"
                              f":effective-Low:no-valid-material-downgrade-receipt")
     fail("severe_finding_downgraded_to_low_without_receipt", laundered)
+    executed.append("material_downgrade_laundering")
 
     # (4) staleness: a receipt certified against a different commit than the current tree.
     if args.target:
+        # the ledger must be the one initialised for THIS target — otherwise conformance can be
+        # pointed at a convenient second repo whose HEAD happens to match.
+        want_id = (led.get("target_identity") or {}).get("target_path_id", "")
+        got_id = (compute_identity(Path(args.target)) or {}).get("target_path_id", "")
+        if want_id and got_id and want_id != got_id:
+            fail("target_mismatch", [f"--target resolves to {got_id} but this ledger was initialised "
+                                     f"for {want_id}; refusing to certify one tree against another"])
         cur = _run_git(Path(args.target), "rev-parse", "HEAD").strip()
-        if cur:
-            stale = []
+        if not cur and not (Path(args.target) / ".git").exists():
+            # a legitimately non-VCS target (source drop, tarball) cannot be commit-bound. That is
+            # not a contradiction, but it IS reduced assurance — so it caps at PARTIAL rather than
+            # silently passing, which is what the old code did.
+            skip("staleness", "--target is not a git worktree; receipts cannot be commit-bound, so "
+                              "staleness could not be established")
+        elif not cur:
+            # a git target whose HEAD will not resolve is a real problem, not an absent feature.
+            fail("target_commit_unresolvable",
+                 ["--target has a .git but rev-parse HEAD produced nothing; receipt staleness "
+                  "cannot be established, so no receipt can be certified against the current tree"])
+            executed.append("staleness")
+        else:
+            stale, unbound = [], []
             for cid, c in led["candidates"].items():
                 for kind, r in c.get("receipts", {}).items():
                     cc = r.get("certified_commit", "")
-                    if cc and cc != cur:
+                    if not cc:
+                        # an unbound receipt is not "fresh", it is unverifiable — it was previously
+                        # skipped, which made every legacy receipt permanently un-stale.
+                        unbound.append(f"{cid}:{kind}:no-certified_commit")
+                    elif cc != cur:
                         stale.append(f"{cid}:{kind}:certified@{cc[:10]}!=head@{cur[:10]}")
             fail("stale_receipts_vs_current_commit", stale)
+            fail("receipts_not_bound_to_a_commit", unbound)
+            executed.append("staleness")
+    else:
+        skip("staleness", "--target not supplied — receipt-vs-tree staleness was NOT verified; a "
+                          "PoC that reproduced against a different build would go undetected")
 
     # (5) claims manifest reconciliation: each claim resolves to a ledger fact.
     if args.claims:
@@ -1055,13 +1331,26 @@ def cmd_conformance(args) -> int:
                 elif c.get("state") not in states:
                     bad.append(f"claim {key}:{ref} -> ledger says state={c.get('state')!r}")
         fail("report_claims_contradict_ledger", bad)
+        executed.append("claims")
+    else:
+        skip("claims", "--claims not supplied — the report's own assertions were NOT reconciled "
+                       "against the ledger; this is the axis that catches a report claiming a "
+                       "disposition the state machine never recorded")
 
-    ok = not failures
-    print(json.dumps({"conformance": "PASS" if ok else "FAIL",
-                      "checks_run": ["coverage", "ledger_integrity", "pending",
-                                     "material_downgrade_laundering", "staleness", "claims"],
+    # VERDICT. Three values, derived from facts — never a caller-chosen label, and there is no
+    # "PASS with residue". A known contradiction is FAIL even on an interim run; skipped mandatory
+    # inputs are PARTIAL (nothing contradicted, but nothing like full assurance either).
+    if failures:
+        verdict = "FAIL"
+    elif skipped:
+        verdict = "PARTIAL"
+    else:
+        verdict = "PASS"
+    print(json.dumps({"conformance": verdict,
+                      "checks_executed": sorted(set(executed)),
+                      "checks_skipped": skipped,
                       "failures": failures}, indent=2))
-    return 0 if ok else 3
+    return 0 if verdict == "PASS" else 3
 
 
 # ================================ main =========================================

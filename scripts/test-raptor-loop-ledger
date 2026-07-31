@@ -24,12 +24,48 @@ def run(*args, stdin=None):
     except Exception: pass
     return p.returncode, out, p.stdout + p.stderr
 
+
+# ---- shared fixture builders -------------------------------------------------
+# A review job now needs vendor + evidence_hash + an explicit dispatched_by: a verdict with no
+# bound evidence and no named vendor substantiates nothing, and dispatched_by used to DEFAULT to
+# the literal "orchestrator" (the field meant to evidence dispatch asserted it by itself).
+def job(target, verdict, model="gpt-5.6-sol", vendor="openai", dispatched_by="orchestrator"):
+    return json.dumps({"model": model, "vendor": vendor, "target": target, "verdict": verdict,
+                       "evidence_hash": f"sha256:{target}:{verdict}",
+                       "dispatched_by": dispatched_by})
+
+
+ALL_VECTORS = ["path", "query", "body", "cookie", "header", "enc-request",
+               "cli", "env", "config", "other"]
+
+
+def vmatrix(tested=("body",), observed="param bound, no structure change", omit=()):
+    """A COMPLETE vector matrix — every delivery vector explicit, because a silently absent vector
+    is an untested vector sold as a complete kill. `omit` deliberately drops vectors so a test can
+    assert the incompleteness refusal."""
+    rows = []
+    for v in ALL_VECTORS:
+        if v in omit:
+            continue
+        if v in tested:
+            rows.append({"vector": v, "status": "tested",
+                         "command_or_fixture": f"fixture:{v}", "observed": observed})
+        else:
+            rows.append({"vector": v, "status": "not-applicable",
+                         "rationale": f"{v} does not reach this sink on this route"})
+    return rows
+
 def main():
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="ledger-test-"))  # macOS /var,/tmp are symlinks
     target = os.path.join(tmp, "target"); os.makedirs(target)
     # a real source file so evidence spans / paths resolve
     with open(os.path.join(target, "parser.c"), "w") as f:
         f.write("int f(int n){char b[8];for(int i=0;i<n;i++)b[i]=0;return b[0];}\n")
+    # a real git worktree so receipts are commit-bound and the staleness axis can actually run —
+    # conformance no longer fails OPEN when it cannot resolve a commit.
+    _g = ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", target]
+    for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "fixture"]):
+        subprocess.run(_g + cmd, capture_output=True, text=True)
     ledger = os.path.join(tmp, "out", "ledger")
     L = ["--ledger", ledger]
     try:
@@ -59,18 +95,14 @@ def main():
 
         # --- rejection citing a NONEXISTENT job is REFUSED ---
         full_reject = {"rejection_reason": "non-exploitable", "counter_hypothesis": "input is bound as a parameter",
-            "vector_matrix": [{"vector": "query", "status": "tested", "command_or_fixture": "fix#1",
-                               "observed": "param bound, no structure change"},
-                              {"vector": "body", "status": "tested", "command_or_fixture": "fix#2", "observed": "same"},
-                              {"vector": "header", "status": "not-applicable", "rationale": "q not read from headers"}],
+            "vector_matrix": vmatrix(tested=("query", "body")),
             "independent_review": {"job_id": "J-doesnotexist"}}
         rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
                          "--to", "rejected", "--receipt", json.dumps(full_reject))
         check("rejection citing unknown job REFUSED", rc == 3 and any("not a recorded" in e for e in out.get("errors", [])))
 
         # --- record an OVERTURN job; rejection citing it is still REFUSED ---
-        rc, jout, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "gpt-5.6-sol",
-            "target": cid, "verdict": "overturn", "evidence_hash": "h1"}))
+        rc, jout, _ = run("cross-vendor", *L, "--job", job(cid, "overturn"))
         jid_over = jout.get("job_id"); check("cross-vendor overturn recorded", bool(jid_over))
         fr2 = {**full_reject, "independent_review": {"job_id": jid_over}}
         rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
@@ -78,8 +110,7 @@ def main():
         check("rejection on OVERTURN verdict REFUSED", rc == 3 and any("not 'uphold'" in e for e in out.get("errors", [])))
 
         # --- record an UPHOLD job; full bundle now ACCEPTED ---
-        rc, jout, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "gpt-5.6-sol",
-            "target": cid, "verdict": "uphold", "evidence_hash": "h2"}))
+        rc, jout, _ = run("cross-vendor", *L, "--job", job(cid, "uphold"))
         jid_up = jout.get("job_id")
         fr3 = {**full_reject, "independent_review": {"job_id": jid_up}}
         rc, out, _ = run("transition", *L, "--target", target, "--candidate", cid,
@@ -90,9 +121,9 @@ def main():
         rc, out, _ = run("add", *L, "--target", target, "--record", json.dumps({
             "finding_sig": "sig-x", "component": "c", "path": "parser.c", "bug_class": "cwe-79"}))
         cx = out["candidate_id"]
-        rc, jj, _ = run("cross-vendor", *L, "--job", json.dumps({"model": "m", "target": cx, "verdict": "uphold"}))
+        rc, jj, _ = run("cross-vendor", *L, "--job", job(cx, "uphold", model="m"))
         unreach = {"rejection_reason": "unreachable", "counter_hypothesis": "route not registered",
-            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "404"}],
+            "vector_matrix": vmatrix(tested=("path",), observed="404"),
             "independent_review": {"job_id": jj["job_id"]}}
         rc, out, _ = run("transition", *L, "--target", target, "--candidate", cx, "--to", "rejected",
                          "--receipt", json.dumps(unreach))
@@ -189,29 +220,83 @@ def main():
         check("conformance FAILS on a claim with no such candidate",
               any("no such candidate" in x for x in out["failures"].get("report_claims_contradict_ledger", [])))
 
-        # (9) staleness: a receipt certified against a different commit than HEAD -> flagged.
-        # target has no git repo here (identity commit empty), so simulate by pointing --target at
-        # a git repo whose HEAD differs from the (empty) certified_commit. Use the skill repo as a
-        # commit-bearing tree: certified_commit was "" (no git in target), HEAD is non-empty -> stale.
+        # (9) staleness + target binding. Pointing --target at a DIFFERENT commit-bearing tree must
+        # not let that tree's HEAD stand in for the reviewed one: the gate refuses to certify one
+        # tree against another, and every receipt bound to the real target reads as stale there.
         skillrepo = HERE + "/.."
         rc, out, _ = run("conformance", *L, "--target", skillrepo)
-        # confirmed candidates here were certified with empty commit (target had no git) -> not flagged
-        # (empty certified_commit is skipped). This asserts the check RUNS without false positives:
-        check("conformance staleness check runs without false-positive on uncommitted receipts",
-              "stale_receipts_vs_current_commit" not in out["failures"])
+        check("conformance REFUSES a --target that is not the initialised target",
+              "target_mismatch" in out["failures"], out.get("failures", {}).keys())
+        check("receipts certified elsewhere read as stale against a foreign HEAD",
+              "stale_receipts_vs_current_commit" in out["failures"])
+        # against the REAL target the same receipts are fresh — no false positive.
+        rc, out, _ = run("conformance", *L, "--target", target)
+        check("no staleness false-positive against the correct target",
+              "stale_receipts_vs_current_commit" not in out["failures"] and
+              "target_mismatch" not in out["failures"], out.get("failures"))
 
-        # after completing ALL pendings, a fully-covered run with no contradicting claims PASSES
+        # --- a live_validation no longer closes on nothing (the widest fail-open in the old gate) ---
+        _, sfin, _ = run("summary", *L)
+        lv = next(a for a in sfin["open_pending_actions"] if a["required_action"] == "live_validation")
+        rc, out, _ = run("pending-complete", *L, "--action", lv["action_id"])
+        check("live_validation with EMPTY receipt REFUSED", rc == 3 and out.get("pending_complete") == "REFUSED")
+        rc, out, _ = run("pending-complete", *L, "--action", lv["action_id"], "--receipt", json.dumps({
+            "outcome": "inconclusive", "observation": "no instance reachable", "artifacts": ["log"],
+            "build_digest": "sha256:deadbeef"}))
+        check("live_validation inconclusive without blocker REFUSED", rc == 3)
+        rc, out, _ = run("pending-complete", *L, "--action", lv["action_id"], "--receipt", json.dumps({
+            "outcome": "safe", "observation": "server rebinds the id to the session; 403 returned",
+            "artifacts": ["live/lv1.log"], "build_digest": "sha256:deadbeef"}))
+        check("live_validation with a real observation ACCEPTED", rc == 0)
+        rc, out, _ = run("pending-complete", *L, "--action", lv["action_id"], "--receipt", json.dumps({
+            "outcome": "vulnerable", "observation": "rewrite attempt", "artifacts": ["x"],
+            "build_digest": "d"}))
+        check("completed action cannot be re-completed (receipts immutable)", rc == 3)
+
+        # closing the run now requires RESOLVING every candidate, not just closing actions.
         _, sfin, _ = run("summary", *L)
         for a in sfin["open_pending_actions"]:
-            ra = a["required_action"]
-            if ra == "dirty_sweep":
+            if a["required_action"] == "dirty_sweep":
                 run("pending-complete", *L, "--action", a["action_id"], "--receipt", json.dumps({
                     "enumeration_recipe": {"commands": ["x"]}, "discovered_sites": [], "site_set_hash": "h"}))
-            else:
-                run("pending-complete", *L, "--action", a["action_id"])
+        # cx: the unreachable kill, now WITH the gating evidence it was refused for
+        gated = {**unreach, "gating": {"build_digest": "b1", "config_digest": "c1",
+                                       "route_or_symbol_evidence": "no route registers this handler"}}
+        run("transition", *L, "--target", target, "--candidate", cx, "--to", "rejected",
+            "--receipt", json.dumps(gated))
+        # the needs-live candidate: its live test came back safe, so it lands as rejected
+        nl_job = run("cross-vendor", *L, "--job", job(cidor, "uphold", model="m"))[1]["job_id"]
+        run("transition", *L, "--target", target, "--candidate", cidor, "--to", "rejected",
+            "--receipt", json.dumps({"rejection_reason": "non-exploitable",
+                "counter_hypothesis": "the server rebinds the id to the session (live-observed)",
+                "vector_matrix": vmatrix(tested=("body",), observed="403"),
+                "independent_review": {"job_id": nl_job}}))
+        # a gate run missing mandatory inputs is PARTIAL, never PASS — and it says WHICH axes it
+        # skipped instead of advertising a hardcoded list of all six.
         rc, out, _ = run("conformance", *L, "--inventory", inv, "--covered", cov, "--omitted", omit)
-        check("conformance PASSES when covered, no open pendings, no bad claims",
+        check("skipped axes cap the verdict at PARTIAL (never a silent PASS)",
+              rc == 3 and out["conformance"] == "PARTIAL", out.get("conformance"))
+        skipped_checks = {s["check"] for s in out.get("checks_skipped", [])}
+        check("checks_skipped names the axes that did not run", {"staleness", "claims"} <= skipped_checks,
+              skipped_checks)
+        check("checks_executed excludes the axes that did not run",
+              "staleness" not in out.get("checks_executed", []) and
+              "claims" not in out.get("checks_executed", []), out.get("checks_executed"))
+
+        claims_f = os.path.join(tmp, "claims.json")
+        _, sfin2, _ = run("summary", *L)
+        with open(claims_f, "w") as f:
+            json.dump({"confirmed": [c["candidate_id"] for c in sfin2["candidates"]
+                                     if c.get("state") in ("confirmed", "corrected")],
+                       "rejected": [c["candidate_id"] for c in sfin2["candidates"]
+                                    if c.get("state") == "rejected"]}, f)
+        rc, out, _ = run("conformance", *L, "--target", target, "--inventory", inv,
+                         "--covered", cov, "--omitted", omit, "--claims", claims_f)
+        check("conformance PASSES only when EVERY axis ran and every diff is empty",
               rc == 0 and out["conformance"] == "PASS", out.get("failures"))
+        check("PASS reports checks_executed built from real branches (not a hardcoded list)",
+              {"coverage", "candidate_closure", "staleness", "claims"} <= set(out.get("checks_executed", [])),
+              out.get("checks_executed"))
 
         # ================= MATERIAL-DOWNGRADE GATE + F-22 regression (fresh ledger) =================
         L2 = ["--ledger", os.path.join(tmp, "out", "ledger2")]
@@ -262,8 +347,8 @@ def main():
         check("critical->High correction ACCEPTED (not material)", rc == 0 and out.get("transition") == "ACCEPTED")
 
         # CASE 4: downgrade citing an OVERTURN cross-vendor job is REFUSED (needs concur_downgrade)
-        run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid, "verdict": "overturn"}))
-        ov_job = run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid, "verdict": "overturn"}))[1]["job_id"]
+        run("cross-vendor", *L2, "--job", job(rcid, "overturn"))
+        ov_job = run("cross-vendor", *L2, "--job", job(rcid, "overturn"))[1]["job_id"]
         md_overturn = conf("low", ss=True); md_overturn["material_downgrade_receipt"] = {
             "negated_hypothesis": "restore is only a DoS", "consequence_trace": "psql streams content",
             "trigger_paths": [{"path_id": "start-restore", "status": "tested", "observed": "400 getAdmin"}],
@@ -274,8 +359,7 @@ def main():
               rc == 3 and any("concur_downgrade" in e for e in out.get("errors", [])))
 
         # CASE 5: downgrade with an UNRESOLVED trigger path (needs-live) is REFUSED (not silently safe)
-        cd_job = run("cross-vendor", *L2, "--job", json.dumps({"model": "gpt-5.6-sol", "target": rcid,
-            "verdict": "concur_downgrade"}))[1]["job_id"]
+        cd_job = run("cross-vendor", *L2, "--job", job(rcid, "concur_downgrade"))[1]["job_id"]
         md_unresolved = conf("low", ss=True); md_unresolved["material_downgrade_receipt"] = {
             "negated_hypothesis": "n", "consequence_trace": "t",
             "trigger_paths": [{"path_id": "start-restore", "status": "tested", "observed": "400 getAdmin"},
@@ -319,7 +403,7 @@ def main():
         sev2 = json.dumps({"finding_sig": "sig-crash", "component": "c", "path": "parser.c",
             "sink": "z", "bug_class": "authz", "potential_severity": "critical"})
         s2 = run("add", *L2, "--target", target, "--record", sev2)[1]["candidate_id"]
-        cd2 = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": s2, "verdict": "concur_downgrade"}))[1]["job_id"]
+        cd2 = run("cross-vendor", *L2, "--job", job(s2, "concur_downgrade", model="m"))[1]["job_id"]
         md_bad = conf("low"); md_bad["material_downgrade_receipt"] = {"negated_hypothesis": "n",
             "consequence_trace": "t", "gating": {"build": "b"}, "independent_review": {"job_id": cd2},
             "trigger_paths": [{"path_id": {"nope": 1}, "status": "tested", "observed": "x"}]}
@@ -368,10 +452,10 @@ def main():
         iv = json.dumps({"finding_sig": "sig-inv", "component": "c", "path": "parser.c",
             "sink": "group write", "bug_class": "authz"})
         ivid = run("add", *L2, "--target", target, "--record", iv)[1]["candidate_id"]
-        ivjob = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": ivid, "verdict": "uphold"}))[1]["job_id"]
+        ivjob = run("cross-vendor", *L2, "--job", job(ivid, "uphold", model="m"))[1]["job_id"]
         inv_reject = {"rejection_reason": "non-exploitable",
             "counter_hypothesis": "duplicate groups are always single-owner so no cross-tenant write",
-            "vector_matrix": [{"vector": "body", "status": "tested", "command_or_fixture": "f", "observed": "scoped"}],
+            "vector_matrix": vmatrix(tested=("body",), observed="scoped"),
             "independent_review": {"job_id": ivjob}}
         rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ivid, "--to", "rejected",
                          "--receipt", json.dumps(inv_reject))
@@ -382,10 +466,10 @@ def main():
         eb = json.dumps({"finding_sig": "sig-eb", "component": "c", "path": "parser.c",
             "sink": "mapUser email", "bug_class": "info-leak"})
         ebid = run("add", *L2, "--target", target, "--record", eb)[1]["candidate_id"]
-        ebjob = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": ebid, "verdict": "uphold"}))[1]["job_id"]
+        ebjob = run("cross-vendor", *L2, "--job", job(ebid, "uphold", model="m"))[1]["job_id"]
         eb_reject = {"rejection_reason": "expected-behavior",
             "counter_hypothesis": "GET /users already returns email so this is intended baseline",
-            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "email present"}],
+            "vector_matrix": vmatrix(tested=("path",), observed="email present"),
             "independent_review": {"job_id": ebjob}}
         rc, out, _ = run("transition", *L2, "--target", target, "--candidate", ebid, "--to", "rejected",
                          "--receipt", json.dumps(eb_reject))
@@ -395,7 +479,7 @@ def main():
         # CASE 7g2: a COMPLETE invariant challenge (substantive all_writers + mutation_paths + bool) ACCEPTED
         iv2 = json.dumps({"finding_sig": "sig-inv2", "component": "c", "path": "parser.c", "sink": "grp", "bug_class": "authz"})
         iv2id = run("add", *L2, "--target", target, "--record", iv2)[1]["candidate_id"]
-        iv2job = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": iv2id, "verdict": "uphold"}))[1]["job_id"]
+        iv2job = run("cross-vendor", *L2, "--job", job(iv2id, "uphold", model="m"))[1]["job_id"]
         inv_ok = {"rejection_reason": "non-exploitable",
             "counter_hypothesis": "the group is always single-owner",
             "invariant_challenge": {"invariant": "at most one owner per group",
@@ -404,7 +488,7 @@ def main():
                                 "asset.service.ts:130 updateAll duplicateId"],
                 "mutation_paths": ["PUT /assets {duplicateId}", "POST /duplicates/resolve"],
                 "counterexample_tested": True},
-            "vector_matrix": [{"vector": "body", "status": "tested", "command_or_fixture": "f", "observed": "index holds"}],
+            "vector_matrix": vmatrix(tested=("body",), observed="index holds"),
             "independent_review": {"job_id": iv2job}}
         rc, out, _ = run("transition", *L2, "--target", target, "--candidate", iv2id, "--to", "rejected",
                          "--receipt", json.dumps(inv_ok))
@@ -413,11 +497,11 @@ def main():
         # CASE 7h2: a COMPLETE expected-behavior kill (policy artifact + quote) ACCEPTED
         eb2 = json.dumps({"finding_sig": "sig-eb2", "component": "c", "path": "parser.c", "sink": "field", "bug_class": "info-leak"})
         eb2id = run("add", *L2, "--target", target, "--record", eb2)[1]["candidate_id"]
-        eb2job = run("cross-vendor", *L2, "--job", json.dumps({"model": "m", "target": eb2id, "verdict": "uphold"}))[1]["job_id"]
+        eb2job = run("cross-vendor", *L2, "--job", job(eb2id, "uphold", model="m"))[1]["job_id"]
         eb_ok = {"rejection_reason": "expected-behavior", "counter_hypothesis": "documented public field",
             "policy_evidence": {"artifact": "docs/api/privacy.md", "span_or_url": "privacy.md:44",
                 "quote": "the display name is a public profile field exposed to all authenticated users"},
-            "vector_matrix": [{"vector": "path", "status": "tested", "command_or_fixture": "f", "observed": "name present"}],
+            "vector_matrix": vmatrix(tested=("path",), observed="name present"),
             "independent_review": {"job_id": eb2job}}
         rc, out, _ = run("transition", *L2, "--target", target, "--candidate", eb2id, "--to", "rejected",
                          "--receipt", json.dumps(eb_ok))
@@ -435,6 +519,121 @@ def main():
         rc, out, _ = run("conformance", *L2)
         check("conformance FLAGS a severe finding downgraded to Low without a receipt (anti-laundering)",
               "severe_finding_downgraded_to_low_without_receipt" in out.get("failures", {}))
+
+        # =============== HARDENING REGRESSIONS (2026-07-31) ================================
+        # Each of these is a defect that was live in the shipped gate and is now closed.
+        L3 = ["--ledger", os.path.join(tmp, "out", "ledger3")]
+        run("init", *L3, "--target", target)
+        mk = lambda sig: run("add", *L3, "--target", target, "--record", json.dumps(
+            {"finding_sig": sig, "component": "c", "path": "parser.c", "bug_class": "authz"}))[1]["candidate_id"]
+
+        # D1 — a kill that tests ONE vector and stays silent on the rest is not a refutation. In a real
+        # run every rejection covered 2 of 10 vectors, and `query` — the vector that actually
+        # executed live in the canonical miss this rule exists for — appeared in none of them.
+        a1 = mk("sig-h1")
+        j1 = run("cross-vendor", *L3, "--job", job(a1, "uphold"))[1]["job_id"]
+        partial = {"rejection_reason": "non-exploitable", "counter_hypothesis": "bound as a parameter",
+                   "vector_matrix": vmatrix(tested=("path",), omit=("query", "cookie")),
+                   "independent_review": {"job_id": j1}}
+        rc, out, _ = run("transition", *L3, "--target", target, "--candidate", a1, "--to", "rejected",
+                         "--receipt", json.dumps(partial))
+        check("D1 rejection with an INCOMPLETE vector matrix REFUSED",
+              rc == 3 and any("INCOMPLETE" in e and "query" in e for e in out.get("errors", [])))
+        dupd = {**partial, "vector_matrix": vmatrix() + [{"vector": "body", "status": "tested",
+                "command_or_fixture": "f", "observed": "o"}]}
+        rc, out, _ = run("transition", *L3, "--target", target, "--candidate", a1, "--to", "rejected",
+                         "--receipt", json.dumps(dupd))
+        check("D1 duplicate vector rows REFUSED", rc == 3 and any("duplicate" in e for e in out.get("errors", [])))
+
+        # D7 — a review job must name its vendor, bind to evidence, and state its dispatcher. These
+        # were previously optional/defaulted: all 86 jobs in a real run had an EMPTY evidence_hash,
+        # and dispatched_by defaulted to the literal "orchestrator" it was meant to evidence.
+        for miss in ("vendor", "evidence_hash", "dispatched_by"):
+            rec = json.loads(job(a1, "uphold")); rec.pop(miss)
+            rc, _o, err = run("cross-vendor", *L3, "--job", json.dumps(rec))
+            check(f"D7 cross-vendor without {miss} REFUSED", rc != 0 and miss in err)
+
+        # D7b — one uphold job cannot be recycled across findings; a review of a different candidate
+        # is not a review of this one. (The downgrade path checked this; the rejection path did not.)
+        a2 = mk("sig-h2")
+        foreign = {"rejection_reason": "non-exploitable", "counter_hypothesis": "bound",
+                   "vector_matrix": vmatrix(), "independent_review": {"job_id": j1}}
+        rc, out, _ = run("transition", *L3, "--target", target, "--candidate", a2, "--to", "rejected",
+                         "--receipt", json.dumps(foreign))
+        check("D7b rejection citing a job that reviewed ANOTHER candidate REFUSED",
+              rc == 3 and any("not this candidate" in e for e in out.get("errors", [])))
+
+        # D4 — a candidate left open/needs-live must block closure; the promised candidate-ledger
+        # diff was documented but never implemented, so unresolved work was invisible to the gate.
+        rc, out, _ = run("conformance", *L3, "--target", target, "--inventory", inv)
+        check("D4 non-terminal candidates block closure",
+              "nonterminal_candidates_block_closure" in out.get("failures", {}))
+
+        # D2 — the empirical walk that took a real ledger from FAIL to PASS with zero evidence:
+        # close every live_validation with `{}`. Now default-denied.
+        a3 = mk("sig-h3")
+        run("transition", *L3, "--target", target, "--candidate", a3, "--to", "needs-live-validation",
+            "--receipt", json.dumps({"safe_test": "curl x", "potential_severity": "High"}))
+        _, s3, _ = run("summary", *L3)
+        lv3 = next(a for a in s3["open_pending_actions"] if a["required_action"] == "live_validation")
+        rc, out, _ = run("pending-complete", *L3, "--action", lv3["action_id"], "--receipt", "{}")
+        check("D2 live_validation cannot be closed with an empty receipt", rc == 3)
+
+        # D3 — direct-edit / legacy: a stored terminal receipt is RE-VALIDATED, not merely present.
+        led3 = os.path.join(tmp, "out", "ledger3", "ledger.json")
+        with open(led3) as f: raw3 = _j.load(f)
+        raw3["candidates"][a2] = {**raw3["candidates"][a2], "state": "rejected", "receipts": {
+            "rejection": {"receipt_id": "R-forged", "certified_commit": "",
+                          "receipt": {"rejection_reason": "non-exploitable",
+                                      "counter_hypothesis": "hand-edited past the transition gate",
+                                      "vector_matrix": [{"vector": "path", "status": "tested",
+                                                         "command_or_fixture": "f", "observed": "o"}]}}}}
+        raw3["candidates"][a3]["state"] = "reviewed"      # a state the vocabulary does not contain
+        with open(led3, "w") as f: _j.dump(raw3, f)
+        rc, out, _ = run("conformance", *L3, "--target", target, "--inventory", inv)
+        check("D3 a stored rejection receipt failing the CURRENT contract is caught",
+              "stored_receipt_fails_current_contract" in out.get("failures", {}))
+        check("D3 a candidate in an unknown state is caught",
+              "candidate_in_unknown_state" in out.get("failures", {}))
+
+        # D-tree-mixing — one engagement, one tree. Observed failure: a ledger initialised against one
+        # path while the audit ran on another, so every receipt was written with an empty
+        # certified_commit and nothing noticed for days. The guard fires at the WRITE, because by
+        # closure time the evidence is already unbindable.
+        other = os.path.join(tmp, "other-tree"); os.makedirs(other, exist_ok=True)
+        rc, _o, err = run("add", *L3, "--target", other, "--record", json.dumps(
+            {"finding_sig": "sig-wrong-tree", "component": "c", "path": "parser.c", "bug_class": "authz"}))
+        check("D-tree-mixing add against a FOREIGN target REFUSED", rc != 0 and "initialised for" in err)
+        rc, _o, err = run("transition", *L3, "--target", other, "--candidate", a1,
+                          "--to", "rejected", "--receipt", json.dumps(partial))
+        check("D-tree-mixing transition against a FOREIGN target REFUSED", rc != 0 and "initialised for" in err)
+
+        # a git worktree whose HEAD will not resolve must not silently produce an unbound receipt
+        led3b = os.path.join(tmp, "out", "ledger3", "ledger.json")
+        with open(led3b) as f: rawb = _j.load(f)
+        rawb["target_identity"]["commit_bindable"] = True
+        with open(led3b, "w") as f: _j.dump(rawb, f)
+        broken = os.path.join(tmp, "broken"); os.makedirs(broken, exist_ok=True)
+        rawb["target_identity"]["target_path_id"] = __import__("hashlib").sha256(
+            os.path.realpath(broken).encode()).hexdigest()[:16]
+        with open(led3b, "w") as f: _j.dump(rawb, f)
+        # use a receipt that PASSES validation, so execution reaches the commit-binding step
+        rc, _o, err = run("transition", *L3, "--target", broken, "--candidate", a1,
+                          "--to", "needs-live-validation", "--receipt", json.dumps(
+                              {"safe_test": "curl /x; 200=vuln 403=safe", "potential_severity": "High"}))
+        check("D-tree-mixing commit-bindable target with unresolvable HEAD REFUSED at write",
+              rc != 0 and "empty certified_commit" in err, err[:160])
+
+        # D-unused-ledger — an UNUSED ledger cannot certify a finished run. Observed real case: an
+        # engagement whose ledger/ was left completely empty while the report read as complete;
+        # every set-difference below is vacuously satisfied by absence.
+        L4 = ["--ledger", os.path.join(tmp, "out", "ledger4")]
+        rc, out, _ = run("conformance", *L4, "--target", target, "--inventory", inv)
+        check("D-unused-ledger an EMPTY ledger cannot PASS (vacuous coverage is not coverage)",
+              rc == 3 and "empty_ledger_no_hunt_recorded" in out.get("failures", {}),
+              out.get("conformance"))
+        check("D-unused-ledger an uninitialised ledger is flagged",
+              "ledger_never_initialised" in out.get("failures", {}))
 
         print(f"\n{passed} passed, {failed} failed")
         return 1 if failed else 0
