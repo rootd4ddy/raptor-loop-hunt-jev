@@ -906,79 +906,56 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   *grep-only-sweep* fraud class exists because we lacked. **Incremental recall over a plain
   pass is not demonstrated** — treat it as an experimental candidate source, not a known win.
 
-  **What `/audit` is NOT, however its own output is labelled:**
-  - **Not a coverage authority.** No `/audit` status, record, function count, or negative sweep
-    is coverage evidence. None of it may populate an altitude×slice cell, the component matrix,
-    or an entrypoint receipt. Loop-hunt's denominator is components plus the entrypoint-manifest
-    spine, and it is engagement-scoped; `/audit`'s records accumulate across runs and carry no
-    run, commit or tree identity. An audit-generated rule may *seed* a separately executed hunt
-    action — only that action's own receipt counts.
-  - **Not a disposition producer.** An `/audit` finding does not carry loop-hunt's typed
-    receipt: no `oracle_class`, no machine predicate, no observed-artifact hashes. (A saved
-    Mode-2 rule *is* re-runnable — the gap is the receipt, not re-runnability.) `finding`,
-    `suspicious` and `dormant` all import as **`open` candidates** and run the full
-    generate → judge → live-verify chain.
-  - **Not the judge.** `/audit`'s written rule ("if a tool refutes it, the hypothesis is
-    discarded") invites reading a *non-matching* rule as refutation. A negative tool result
-    refutes only that exact rule or query under its exact scope — it cannot reject the
-    underlying candidate and it never covers the cell. Putting `/audit` in the judge seat would
-    mechanise this methodology's defining false negative.
-  - **`dormant` is a label, not a disposition.** Import it as `open`. Do NOT read it as the
-    permitted hard-suppressor: `/audit`'s own G7 documents a two-signal gate (zero static
-    callers AND `absent` AND full DWARF), but its run path demotes on a name-keyed `absent`
-    alone, with no caller or DWARF-tier test. A fresh loop-owned verifier may use zero callers
-    plus an *observed* `absent` at full-DWARF tier as reachability **evidence**; `symbol_only`
+  **What `/audit` is NOT, however its own output is labelled.** Its records accumulate across
+  runs and carry no run/commit/tree identity, so none of them can speak for *this* engagement:
+  - **Not coverage.** No status, record, function count or negative sweep may populate an
+    altitude×slice cell, the component matrix, or an entrypoint receipt. An audit rule may
+    *seed* a hunt action; only that action's own receipt counts.
+  - **Not a disposition.** It carries no `oracle_class`, no machine predicate, no observed-artifact
+    hashes. `finding` / `suspicious` / `dormant` all import as **`open`** and run the full
+    generate → judge → live-verify chain. (A Mode-2 rule *is* re-runnable — the gap is the receipt.)
+  - **Not the judge.** Its own wording ("if a tool refutes it, the hypothesis is discarded")
+    invites reading a *non-matching* rule as refutation. A negative tool result refutes that
+    exact rule under its exact scope — never the candidate, never the cell. Putting `/audit` in
+    the judge seat would mechanise this methodology's defining false negative.
+  - **`clean` never counts** — not even receipted. It can come from a triage or prefilter
+    short-circuit (triage fires before the function's source context is even built). A negative
+    rule says nothing about the cell's other hypotheses or bug classes. Receipts or `UNCOVERED`.
+  - **`dormant` is a label.** Import as `open`. `/audit`'s own G7 requires zero static callers
+    AND `absent` AND full DWARF, but its run path demotes on a name-keyed `absent` alone. A fresh
+    loop-owned verifier may use the full two-signal form as reachability *evidence*; `symbol_only`
     never demotes, and terminal rejection still needs the complete rejection receipt.
-  - **Mode-2 synthesis ≠ a `DIRTY_SWEEP` receipt.** It is a very good *enumeration recipe*
-    generator — the hardest part of that receipt — but it emits no per-site disposition, no
-    (de)serialization-loader check and no re-runnable site-set hash, and it **truncates its hit
-    set at a fixed cap**. Worse, the completeness flag is unreliable at this boundary: fresh
-    synthesis records a cap flag internally but the `/audit` adapter drops it, and replayed
-    library rules truncate without setting it at all. So a capped sweep can present as a
-    complete site set with nothing to show it. Take the recipe; re-run it through a
-    receipt-producing path and keep the receipt in the ledger.
-  - **`clean` never counts as loop coverage.** Not even a receipted one. A negative rule proves
-    only that *that rule* did not match under its exact scope — it says nothing about the other
-    hypotheses or bug classes in the cell, so re-runnability is evidence *quality*, never cell
-    completeness. And a `clean` can be produced by a triage or prefilter short-circuit: triage
-    can fire before the function's source context is even built, and prefilter is a bounded
-    source heuristic rather than a hypothesis-directed hunt. Receipts or `UNCOVERED`.
+  - **Mode-2 synthesis ≠ a `DIRTY_SWEEP` receipt.** Excellent *enumeration recipe* — the hardest
+    part — but no per-site disposition, no (de)serialization-loader check, no re-runnable
+    site-set hash, and it truncates at a fixed cap whose flag is unreliable here (fresh synthesis
+    records it internally, the adapter drops it, replayed library rules never set it). A capped
+    sweep can present as complete with nothing to show it. Take the recipe, re-run it through a
+    receipt-producing path, keep that receipt.
 
-  **Lead-import gates.** Satisfying these permits *lead import only* — never `/audit` coverage
-  and never a terminal disposition. The stock `/audit` CLI does not currently satisfy all of
-  them, so integration stays manual and fail-closed:
-  1. **Coverage bound to identity.** Records must carry `(function_id, run_id, target_commit +
-     tree_digest, receipt_ids[])`, and the conformance gate must reject bare-name coverage lines
-     and count only this engagement's target identity. Until then, `/audit` coverage accumulates
-     across runs while the gate reads unqualified names — so a component hunted against a
-     *different tree* silently satisfies this engagement. Prior-engagement records load as KB
-     `prior-visited: recheck` **priority**, never as coverage.
-  2. **History-suppression cut.** `/audit` has cross-run surfaces that can *suppress*, by two
-     distinct mechanisms. A suppression-category project context, a false-positive feedback
-     path, prior annotations and same-run session observations are injected into later reviewer
-     prompts — biasing a reviewed function toward `clean`, and breaking the generate-from-raw
-     isolation the two-reasoner split exists to protect. Separately, historical strategy
-     weighting combined with `--budget` truncation can push a function **below the execution
-     cutoff so it is never reviewed at all**. This methodology permits exactly one
-     hard-suppressor. **There is currently no CLI switch to disable any of this**, so this gate
-     is a blocker rather than an instruction: until it exists, budget-dropped and
-     history-deprioritised functions must be emitted as explicit `UNCOVERED` rows, never left
-     to vanish.
-  3. **Reachability gate matches its own G7.** Zero callers AND `absent` AND full DWARF before
-     any demotion — which the run path does not currently do (see `dormant` above).
-  4. **Typed, fail-closed import.** An allowlisted status mapping: `finding` / `suspicious` /
-     `dormant` and every Mode-2 hit → `open`; `clean` / `error` → telemetry, never coverage;
-     any unknown status → refuse the import. Every imported lead carries stable function
-     identity, run id, target path id, commit and dirty-tree digest. Mode-2 imports carry
-     completeness and total-match counts, or they are refused. Component coverage is derived
-     only from loop-owned action receipts — the conformance gate must never accept an `/audit`
-     status, nor a hand-written covered-component line, as proof.
+  **Lead-import gates — all four, or no import.** These permit *lead import only*. The stock CLI
+  does not satisfy them all, so integration stays manual and fail-closed:
+  1. **Coverage bound to identity** — `(function_id, run_id, target_commit + tree_digest,
+     receipt_ids[])`. Until then its records accumulate across runs while the gate reads
+     unqualified names, so a component hunted against a *different tree* silently satisfies this
+     engagement. Prior-engagement records load as KB recheck **priority**, never coverage.
+  2. **History-suppression cut** — suppression-category context, false-positive feedback, prior
+     annotations and same-run observations are injected into later reviewer prompts, biasing a
+     function toward `clean` and breaking the generate-from-raw isolation the two-reasoner split
+     protects; separately, strategy weighting plus `--budget` truncation can drop a function
+     below the execution cutoff so it is never reviewed at all. **No CLI switch disables this
+     today**, so this gate is a blocker: budget-dropped and history-deprioritised functions must
+     be emitted as explicit `UNCOVERED` rows, never left to vanish.
+  3. **Reachability gate matches its own G7** — zero callers AND `absent` AND full DWARF before
+     any demotion, which the run path does not currently do.
+  4. **Typed, fail-closed import** — `finding`/`suspicious`/`dormant` and every Mode-2 hit →
+     `open`; `clean`/`error` → telemetry only; unknown status → refuse. Every lead carries
+     function identity, run id, target path id, commit and dirty-tree digest; Mode-2 imports
+     carry completeness and total-match counts or are refused.
 
-  Ignored, these compound: history either biases the review toward `clean` or drops the function
-  below the budget cutoff, accumulated cross-run records let its component read as covered
-  anyway, and because `/audit` has no `needs-live-validation` state a server-dependent survivor
-  has nowhere to sit but `clean` or `dormant` — a clean-looking closure gate over a component
-  nobody hunted this engagement.
+  Ignored, these compound: history biases the review toward `clean` or drops the function below
+  the budget cutoff, accumulated cross-run records let its component read as covered anyway, and
+  since `/audit` has no `needs-live-validation` state a server-dependent survivor has nowhere to
+  sit but `clean` or `dormant` — a clean-looking closure gate over a component nobody hunted.
 - **The main engine:** `/agentic --understand --validate` with multiple `--model` flags — each is
   an independent, isolated reasoner (there is no `--independent` toggle; parallelism *is* the
   independence) — plus `--judge` (generate-then-refute) and `--consensus` / `--aggregate` for

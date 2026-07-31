@@ -527,9 +527,9 @@ def main():
         mk = lambda sig: run("add", *L3, "--target", target, "--record", json.dumps(
             {"finding_sig": sig, "component": "c", "path": "parser.c", "bug_class": "authz"}))[1]["candidate_id"]
 
-        # D1 — a kill that tests ONE vector and stays silent on the rest is not a refutation. In a real
-        # run every rejection covered 2 of 10 vectors, and `query` — the vector that actually
-        # executed live in the canonical miss this rule exists for — appeared in none of them.
+        # D1 — a kill that tests ONE vector and stays silent on the rest is not a refutation. In
+        # observed runs rejections covered a small minority of the vector set, and `query` — the
+        # vector that executed live in the canonical miss this rule exists for — appeared in none.
         a1 = mk("sig-h1")
         j1 = run("cross-vendor", *L3, "--job", job(a1, "uphold"))[1]["job_id"]
         partial = {"rejection_reason": "non-exploitable", "counter_hypothesis": "bound as a parameter",
@@ -546,8 +546,8 @@ def main():
         check("D1 duplicate vector rows REFUSED", rc == 3 and any("duplicate" in e for e in out.get("errors", [])))
 
         # D7 — a review job must name its vendor, bind to evidence, and state its dispatcher. These
-        # were previously optional/defaulted: all 86 jobs in a real run had an EMPTY evidence_hash,
-        # and dispatched_by defaulted to the literal "orchestrator" it was meant to evidence.
+        # were previously optional/defaulted: in observed runs every job carried an EMPTY
+        # evidence_hash, and dispatched_by defaulted to the literal "orchestrator" it evidences.
         for miss in ("vendor", "evidence_hash", "dispatched_by"):
             rec = json.loads(job(a1, "uphold")); rec.pop(miss)
             rc, _o, err = run("cross-vendor", *L3, "--job", json.dumps(rec))
@@ -598,7 +598,7 @@ def main():
 
         # D-tree-mixing — one engagement, one tree. Observed failure: a ledger initialised against one
         # path while the audit ran on another, so every receipt was written with an empty
-        # certified_commit and nothing noticed for days. The guard fires at the WRITE, because by
+        # certified_commit and nothing detected it. The guard fires at the WRITE, because by
         # closure time the evidence is already unbindable.
         other = os.path.join(tmp, "other-tree"); os.makedirs(other, exist_ok=True)
         rc, _o, err = run("add", *L3, "--target", other, "--record", json.dumps(

@@ -313,11 +313,11 @@ def compute_identity(target: Path) -> dict:
 def _assert_target_matches(led: dict, target: str) -> None:
     """Every write must name the SAME tree the ledger was initialised for.
 
-    Observed failure this prevents: in a real engagement the ledger was initialised against one
-    path while the KB was given the actual repo, so the ledger's identity carried an empty commit
-    and ALL 56 receipts were written with `certified_commit: ""`. Nothing noticed for days, because
-    the mismatch was only ever detectable at closure — by which time the evidence is already
-    unbindable. Catch it at the write, not at the gate."""
+    Observed failure this prevents: a ledger initialised against one path while the audit ran on
+    another. The identity then carries an empty commit and every receipt is written with
+    `certified_commit: ""` — unbindable to any tree, and so unable to ever prove it certified the
+    audited code. The mismatch is only detectable at closure, by which point the evidence is
+    already unbindable. Catch it at the write, not at the gate."""
     want = (led.get("target_identity") or {}).get("target_path_id", "")
     if not want:
         return
@@ -961,10 +961,10 @@ def _validate_enumerate_trigger_paths(receipt: dict, led: dict, cand: dict) -> t
 
 
 def _validate_live_validation(receipt: dict, led: dict, cand: dict) -> tuple[bool, list]:
-    """A server-dependent finding's live test. Previously this closed on `{}` — the single widest
-    fail-open in the gate: three of these were closed with no evidence at all and conformance then
-    returned PASS. A live validation that resolves nothing does not close the action; it must say
-    what it OBSERVED and which way the predicate went."""
+    """A server-dependent finding's live test. This previously closed on `{}` — the widest
+    fail-open in the gate, and enough on its own to walk a run's verdict from FAIL to PASS with no
+    evidence at all. A live validation that resolves nothing does not close the action; it must
+    say what it OBSERVED and which way the predicate went."""
     errs = []
     outcome = receipt.get("outcome")
     if outcome not in LIVE_OUTCOMES:
