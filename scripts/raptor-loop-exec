@@ -80,17 +80,42 @@ def plan_execution(cmd, requires, grant):
                        f"{sorted(granted)} does not authorize")
     if "write" in req and not grant.get("writable_paths"):
         reasons.append("capability 'write' requires grant.writable_paths (writes must be scoped)")
+    elif "write" in req:
+        # writes must land inside the declared anchor — a "scoped" write to /etc or ~ is not scoped.
+        anchors = [os.path.normpath(str(a)) for a in (grant.get("output"), grant.get("target")) if a]
+        for w in grant["writable_paths"]:
+            wp = os.path.normpath(str(w))
+            if not any(wp == a or wp.startswith(a.rstrip(os.sep) + os.sep) for a in anchors):
+                reasons.append(f"writable path {w!r} is outside the declared output/target "
+                               f"{anchors} — writes must be scoped to loop-owned locations")
+    # An ISOLATION ANCHOR is mandatory. core.sandbox engages filesystem isolation only when the
+    # caller signals it wants some — on macOS, `write_isolation_engaged = bool(output or
+    # writable_paths or target or restrict_reads)` (seatbelt.py) — so a grant naming none of them
+    # produced a "sandboxed" run with UNRESTRICTED writes. An unscoped plan is not a least-
+    # privilege plan; refuse to emit one rather than print a plan that does not isolate.
+    if not (grant.get("target") or grant.get("output")):
+        reasons.append("grant.target or grant.output is required — the sandbox engages filesystem "
+                       "isolation only when the plan names what it runs against / writes into; "
+                       "without one the command would run with unrestricted writes")
     if reasons:
         raise ExecDenied(reasons)
 
-    # authorized -> LEAST-PRIVILEGE sandbox kwargs (relax only what's required AND granted)
-    kw = {"block_network": True, "caller_label": str(grant.get("caller_label", "loop-exec"))}
+    # authorized -> LEAST-PRIVILEGE sandbox kwargs (relax only what's required AND granted).
+    # The three hardening kwargs below are NOT optional and are not derived from the grant: a
+    # grant cannot opt out of strictness, only widen a specific dimension it was granted.
+    #   profile=strict   -> core.sandbox RAISES when no isolation backend is available instead of
+    #                       logging "Sandbox unavailable" and running the command anyway.
+    #   restrict_reads   -> was opt-in, so by default a live PoC could read the operator's home
+    #                       and credentials. Now on by default; `readable_paths` widens it.
+    #   fake_home        -> keeps a PoC out of the real ~ even when reads are widened.
+    kw = {"block_network": True, "caller_label": str(grant.get("caller_label", "loop-exec")),
+          "profile": "strict", "restrict_reads": True, "fake_home": True}
     if grant.get("target"):
         kw["target"] = grant["target"]
-    if grant.get("restrict_reads"):
-        kw["restrict_reads"] = True
-        if grant.get("readable_paths"):
-            kw["readable_paths"] = list(grant["readable_paths"])
+    if grant.get("output"):
+        kw["output"] = grant["output"]
+    if grant.get("readable_paths"):
+        kw["readable_paths"] = list(grant["readable_paths"])
     if "network" in req:
         kw["block_network"] = False
         if grant.get("proxy_hosts"):
@@ -170,7 +195,18 @@ def main(argv=None) -> int:
             "reasons": ["--exec requested but core.sandbox is unavailable (set RAPTOR_DIR to a "
                         "RAPTOR checkout); refusing to run a live command unsandboxed"]}, indent=2))
         return 3
-    completed = sandbox.run(list(cmd), **sandbox_kwargs)
+    # An importable core.sandbox is NOT an engaged sandbox. Under profile="strict" core.sandbox
+    # raises when no platform isolation backend is usable, instead of logging "Sandbox
+    # unavailable — subprocesses run without namespace isolation" and running anyway. Catching
+    # that here is what makes "refuses to run a live command unsandboxed" true rather than
+    # aspirational: setup failure is a DENIAL, never a degraded run.
+    try:
+        completed = sandbox.run(list(cmd), **sandbox_kwargs)
+    except Exception as e:                                     # noqa: BLE001 - fail closed
+        print(json.dumps({"authorized": True, "executed": False,
+            "reasons": [f"sandbox refused to engage ({type(e).__name__}: {e}); refusing to run a "
+                        "live command without the isolation the plan requires"]}, indent=2))
+        return 3
     print(json.dumps({"decision": decision, "sandbox_kwargs": sandbox_kwargs, "executed": True,
                       "returncode": completed.returncode}, indent=2, default=str))
     return int(completed.returncode or 0)

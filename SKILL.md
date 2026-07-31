@@ -148,13 +148,32 @@ LLM round and don't spend inference rediscovering what they already know:
   locally-built debug binary, the binary-oracle is *deterministic reachability*: it joins the source
   inventory to the binary via DWARF + nm and marks each function `symbol_present` / `inlined` /
   `folded` (survived compilation) or `absent` (compiler/linker removed it). It is **auto-detected
-  and on by default** in `/agentic` and `/codeql` — pass `--binary <path>` for an explicit build,
-  `--binary-auto` for a louder auto-detect, `--no-binary-oracle` to disable, `--target-kind
-  library|hybrid|application` for library/app targets. An `absent` verdict hard-suppresses the
-  finding *before* the LLM ever sees it (logged to `suppressions.jsonl`); a `symbol_present` /
-  `inlined` verdict is exactly what refutes a later "that's dead code" kill (see the reachability
-  guardrail). This is deterministic dead-code ground truth — don't spend inference re-deriving it,
-  and don't reject a native finding on a compiled-away claim the oracle can settle.
+  and on by default** in `/agentic`, `/codeql` and `/audit` — pass `--binary <path>` for an explicit
+  build, `--binary-auto` for a louder auto-detect, `--target-kind auto|library|hybrid|application`
+  (default `auto`). An `absent` verdict hard-suppresses the finding *before* the LLM ever sees it
+  (`/agentic` and `/codeql` log it to `suppressions.jsonl`; **`/audit` suppresses without logging**,
+  so that path has no audit trail). A `symbol_present` / `inlined` verdict refutes a later "that's
+  dead code" kill — but note it proves *survival in that binary*, not reachability; "no caller" is a
+  separate claim needing `--binary-edges` or a source call graph.
+  - **`--no-binary-oracle` is `/codeql` and `/audit` only.** `/agentic` never registered it (its own
+    argparse block declares `--binary`, `--binary-auto`, `--binary-edges` and nothing else), so the
+    flag is silently ignored there — `/agentic`'s broad escape hatch is `--allow-unreachable`, which
+    disables *all* reachability suppression, not just this oracle.
+  - **This is build-specific compilation-survival evidence, not source ground truth.** `--binary` is
+    validated as "is a file" and nothing binds it to the current commit, dirty tree or build config,
+    so a stale or partial binary can hard-suppress live source findings. Treat a verdict as evidence
+    about *that build*; when the binary's provenance is not pinned to the audited tree, do not let it
+    suppress.
+  - **`/audit` suppresses on MIXED-TIER evidence — prefer `/audit --no-binary-oracle`.** The
+    canonical reachability path refuses to suppress when any contributing binary is below full-DWARF
+    tier, but `/audit`'s extraction keeps an `absent` verdict when merely *one* binary has full DWARF,
+    then drops path, line and tier and keys by bare function name. That defeats both the
+    `symbol_only`-never-demotes rule and the two-signal gate.
+  - **The oracle is not the only pre-LLM kill.** `module_aborts` and `lexical_dead` are also
+    suppression-eligible structural witnesses, and `/agentic` deterministically marks test fixtures
+    `clean` and skips the LLM entirely, with no CLI switch to disable it. "Binary `absent` is the one
+    permitted hard-suppressor" is this methodology's *policy*, not the framework's behaviour — import
+    every fixture/structural suppression as an `open` candidate unless a loop-owned receipt backs it.
 - **Target's OWN known vulns + upstream fixes (prior-art recon) — MANDATORY, not optional.** Pull
   the TARGET application's history, not just its dependencies, BEFORE the LLM loop:
   - **Its CVE/GHSA record** — OSV (`POST https://api.osv.dev/v1/query` `{"package":{"name":..,"ecosystem":..}}`),
@@ -375,10 +394,12 @@ root. Trajectory `final_summary` / "gave-up" / tool-error prose is attacker-infl
 unowned/corrupt store; writes are atomic + locked + fsynced; the inbox is race-free (all appends take the
 lock; synthesize rotates it aside before folding). Schema + `learnings.jsonl` grammar: `references/kb-schema.md`.
 
-**Enable trajectory capture (set once, at run start).** Export `RAPTOR_TRAJECTORY_DIR="$OUTPUT_DIR"` and pass
-the same `--out "$OUTPUT_DIR"` to every `/understand` / `/cve-diff` call so trajectories accumulate:
-
-    export RAPTOR_TRAJECTORY_DIR="$OUTPUT_DIR"
+**Enable trajectory capture.** Pass the run's output directory to every `/understand` and `/cve-diff`
+call so trajectories accumulate — the FLAG is what sets the location, and the flag name differs per
+command: `/understand --out "$OUTPUT_DIR"`, `/cve-diff --output-dir "$OUTPUT_DIR"` (`--out` is not a
+`/cve-diff` flag and is rejected). Exporting `RAPTOR_TRAJECTORY_DIR` yourself is a **no-op**: both
+libexecs assign `os.environ["RAPTOR_TRAJECTORY_DIR"]` from their own resolved output dir, overwriting
+whatever you exported.
 
 `/understand --hunt`, `/understand --trace`, and `/cve-diff` persist automatically. (`/agentic` does not persist
 trajectories; for that stage `reflect` simply has no input and the steering records come from adjudication.)
@@ -820,8 +841,9 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   sufficient. `/understand --study` learns the target's own invariants; use it only to seed candidate
   generation, never as detection, confirmation, refutation, or coverage.
 
-  **Gate hard.** Run at most one prep+run pipeline per engagement — no `raptor-study-loop` and no
-  reading-list follow-up — and only when ALL hold: (1) C/C++ target; (2) pre-map has selected one
+  **Gate hard.** Run at most one prep+run pipeline per engagement — no *operator-driven*
+  `raptor-study-loop` and no reading-list follow-up (note `/audit` spawns `raptor-study-loop` for you,
+  unbounded and un-gated — see Consumption; budget for it) — and only when ALL hold: (1) C/C++ target; (2) pre-map has selected one
   explicit, bounded hot scope: a single file or strict-descendant subsystem directory whose canonical
   path and selection reason are recorded in `TRIED.md`, never the target/repository root, a union of
   disconnected directories, a dependency excluded by the deterministic layer, or an unbounded fan-out;
@@ -840,12 +862,14 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
 
   **Invocation.** There is no `/understand --study` dispatcher flag; drive the libexecs directly from a
   RAPTOR-launched trusted session into a unique, loop-owned study directory outside the target tree.
-  Three placement rules, and they are load-bearing — each one blocks one branch of the `/audit`
-  bridge's `_find_domain_model` search, which is live code (see Consumption below), so breaking any of
-  them silently activates the bridge this methodology deliberately keeps shut:
-  - never the `/audit` output directory, nor its parent (blocks `out_dir/` and `out_dir.parent/`);
-  - never a project-level `concepts/domain-model.json` — that path is checked **first**, ahead of
-    every other candidate, and no naming discipline protects you from it;
+  The placement rules are load-bearing — they exist to keep a `domain-model.json` out of every path
+  the `/audit` bridge's `_find_domain_model` searches, which is live code (see Consumption below), so
+  breaking one silently activates the bridge this methodology deliberately keeps shut. It checks
+  exactly three paths, in this order:
+  - `out_dir.parent/concepts/domain-model.json` — checked **FIRST**, and no naming discipline
+    protects you from it;
+  - `out_dir.parent/domain-model.json`;
+  - `out_dir/domain-model.json` — i.e. never the `/audit` output directory nor its parent.
   - do not give the study directory an `understand_*` name (blocks the sibling-run search).
   ```bash
   STUDY_DIR="$(mktemp -d "$OUTPUT_DIR/study-memory.XXXXXX")"
@@ -869,14 +893,35 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   / target root, consume nothing; partial study output is not a lead. Record the target identity, scope,
   and `$STUDY_DIR` in `TRIED.md` as a non-coverage generator attempt.
 
-  Read `domain-model.json` yourself, and do **not** rely on `/audit` picking it up. The bridge
-  (`core/concepts/audit_bridge.py`) is **live and importable, not dead** — `core/audit/collector.py`
-  calls `_find_domain_model(out_dir)` on an ordinary path. What keeps it inert is *only* the placement
-  discipline above: it is dormant because nothing puts a `domain-model.json` where it looks, not
-  because the code is absent. Treat that as a convention you must uphold, not a property you inherit —
-  enabling it is unsafe because an `inferred` invariant would bypass `/audit`'s tool-evidence gate.
-  Nothing imports this model into loop-hunt automatically, and it may feed only the candidate-source
-  seat below.
+  Read `domain-model.json` yourself, and do **not** rely on `/audit` picking it up.
+
+  **The bridge is NOT dormant, and your placement discipline cannot close it.** `/audit` plants a
+  domain model itself: `core/audit/orchestrator.py:2893-2908` auto-spawns `libexec/raptor-study-loop`
+  over the **whole** `config.target_path` into its own `out_dir`, with `_RAPTOR_TRUSTED=1` set for it,
+  whenever a `reading-list.json` exists. `core/concepts/study.py` then writes `domain-model.json`
+  right where `_find_domain_model` looks. Your rules govern only the study directory *you* create.
+  Three consequences, all live and none opt-out-able (there is no `--no-study` flag, and
+  `OrchestratorConfig` has no study field):
+  - **`/audit` re-reviews and REPLACES its own verdicts using that model.**
+    `_re_review_study_enriched` swaps the prior outcome out when the status changes
+    (`orchestrator.py:8386-8390`, `result.outcomes[idx] = outcome`). A `finding` can become `clean`
+    with **no tool involvement at all** — the exact "model content may never downgrade a candidate"
+    rule below, violated inside the tool.
+  - **`inferred` invariants arrive as assertions of fact.** `primers_from_domain_model`
+    (`audit_bridge.py:348`) filters on relevance only — `s > 1.0` — never on confidence, and then
+    tells the reviewer "*These invariants were extracted from this codebase by /understand --study.
+    A violation is a real bug*" (`audit_bridge.py:354`). Your `{traced, corroborated, tested}`
+    allowlist binds only **your** reading of the model; RAPTOR's own consumer applies no such filter.
+  - **The one-pass-per-engagement study budget is already spent** by that auto-spawn, and spent
+    badly: it runs over the whole target rather than a bounded hot scope, so it fails gate (2) by
+    construction.
+
+  **Operational rule.** Treat any `/audit` outcome as untrusted for *dismissal* when its journal
+  entry carries a non-empty `invariants_available`, `domain_concepts_available`, or
+  `domain_model_hash`. Never accept such a `clean` or a downgraded `finding` as a disposition
+  receipt — re-drive that function through the loop's own generate → judge → live-verify chain from
+  raw. Nothing imports this model into loop-hunt automatically, and it may feed only the
+  candidate-source seat below.
 
   **Consumption.** Import no model claim directly. For each invariant, resolve `invariant.concept` to
   its `concepts[]` entry — citeable evidence is not reliably carried on the invariant itself in the
@@ -965,15 +1010,19 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   the budget cutoff, accumulated cross-run records let its component read as covered anyway, and
   since `/audit` has no `needs-live-validation` state a server-dependent survivor has nowhere to
   sit but `clean` or `dormant` — a clean-looking closure gate over a component nobody hunted.
-- **The main engine:** `/agentic --understand --validate` with multiple `--model` flags — each is
-  an independent, isolated reasoner (there is no `--independent` toggle; parallelism *is* the
-  independence) — plus `--judge` (generate-then-refute) and `--consensus` / `--aggregate` for
-  synthesis. Concurrency and the pipeline are RAPTOR-native here.
+- **The main engine:** `/agentic --understand --validate --max-findings <N>` with multiple `--model`
+  flags — each is an independent, isolated reasoner (there is no `--independent` toggle; parallelism
+  *is* the independence) — plus `--judge` (generate-then-refute) and `--consensus` / `--aggregate`
+  for synthesis. Concurrency and the pipeline are RAPTOR-native here.
+  **Pass `--max-findings` explicitly: the default is 10.** Omitting it silently analyses only the
+  top ten candidates and slices the rest away — and because the ranking is stable, the next round
+  re-derives the *same* ten. Set it to the candidate count, or partition deterministically; every
+  candidate the cap drops is an explicit `UNCOVERED` row, never a silent omission.
 - **Confirm exploitability:** `/validate` on every survivor — real, reachable, exploitable.
 - **Persistence:** run inside a `/project` so the ledger, findings, **and the monotonic Knowledge Base** accrue;
-  keep `TRIED.md` / `FINDINGS.md` and `kb/` in the project's output dir. Export
-  `RAPTOR_TRAJECTORY_DIR="$OUTPUT_DIR"` and share `--out "$OUTPUT_DIR"` across `/understand` / `/cve-diff` so
-  reflect has trajectories. Round 0: `raptor-loop-kb load` to reorder + annotate (never to skip or cover).
+  keep `TRIED.md` / `FINDINGS.md` and `kb/` in the project's output dir. Point every `/understand`
+  (`--out`) and `/cve-diff` (`--output-dir` — `--out` is rejected there) at `$OUTPUT_DIR` so reflect
+  has trajectories; exporting `RAPTOR_TRAJECTORY_DIR` does nothing, the libexecs overwrite it. Round 0: `raptor-loop-kb load` to reorder + annotate (never to skip or cover).
   End-of-run: `raptor-loop-kb reflect`, `append` typed `finding_outcome` records, then `synthesize`. The KB can
   only raise scrutiny — it never suppresses, excludes, or satisfies coverage, in the planner context only.
 - **Disposition receipts + transition gate** (see "Disposition receipts"): the orchestrator writes
@@ -997,12 +1046,17 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   write, running a PoC, using a repo-found credential) declares the capabilities it `--requires`
   (`network` / `write` / `use_secret` / `destructive_test`) and runs only under a typed grant that
   authorizes them — else the broker DENIES it (exit 3). It maps the granted+required capabilities to
-  a **least-privilege** sandbox plan (default `block_network=True`, no writes, egress allowlist via
-  `proxy_hosts`, writes scoped to `writable_paths`) and refuses a grant with no
-  `authorization_source` — *documentation instructing an action is not authorization*, and a
+  a **least-privilege** sandbox plan — `block_network=True`, and unconditionally
+  `profile="strict"` + `restrict_reads=True` + `fake_home=True`, which a grant may widen along a
+  granted dimension but may never opt out of. It refuses a grant with no `target`/`output` anchor
+  (the sandbox engages filesystem isolation only when the plan names what it runs against or writes
+  into — without one, a nominally sandboxed run had unrestricted writes), refuses a `writable_paths`
+  entry outside that anchor, and refuses a grant with no `authorization_source` — *documentation instructing an action is not authorization*, and a
   model-written `AUTH:` line is not a security boundary. With `--exec` it executes that plan through
   RAPTOR's `core.sandbox.run` when a checkout is reachable (`RAPTOR_DIR`), and **refuses to run a
-  live command when no sandbox is available** — never a PoC unsandboxed. This is how "the target's
+  live command unless the sandbox actually engages** — an importable `core.sandbox` is not an engaged
+  sandbox, so `profile="strict"` makes setup failure raise instead of logging "Sandbox unavailable"
+  and running anyway, and the broker converts that raise into a denial. Never a PoC unsandboxed. This is how "the target's
   own text is untrusted data" is enforced against a model-emitted command: a repo-provided script
   never runs implicitly; it needs an explicit capability grant.
 - Honor RAPTOR's EXECUTION RULES — run the lifecycle/command verbatim, no added pipes or flags.
@@ -1046,20 +1100,21 @@ for k in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY; do
 done
 ```
 
-Then wire `/agentic` (model ids are `provider/model`; `provider/default` resolves the
-configured default for that vendor):
+Then wire `/agentic`. Model ids are `provider/model` and must name a **concrete configured model**
+— `provider/default` is NOT a sentinel: the resolver strips the provider and builds an entry whose
+literal model name is `default`. (Provider defaults substitute only when the model name is empty.)
 
 - **Two or more vendors keyed → cross-vendor judge (preferred).** Generate with one vendor,
   judge with the other:
   ```
-  /agentic --understand --validate --model openai/default --judge anthropic/claude-haiku-4-5
+  /agentic --understand --validate --model openai/<configured-model> --judge anthropic/claude-haiku-4-5
   ```
   Add `--consensus <other-vendor-model>` for a blind second opinion and `--aggregate
   <strongest-model>` to synthesize. Each extra `--model` is another independent reasoner.
 
 - **Only one vendor keyed (e.g. OpenAI only).** Two options, use both:
   1. Same-vendor, different tier as judge so generation still ≠ verification:
-     `--model openai/default --judge openai/<stronger-or-different-tier>`.
+     `--model openai/<model> --judge openai/<stronger-or-different-tier>`.
   2. Use the **Claude Code harness itself as your cross-vendor judge** — it's a second vendor
      even with no second env key. After `/agentic` returns, have the orchestrating session
      re-read each survivor's cited code *from raw* and try to refute it. That is the

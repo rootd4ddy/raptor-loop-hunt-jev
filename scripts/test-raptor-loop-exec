@@ -48,10 +48,12 @@ def main():
     check("network maps to egress allowlist",
           kw.get("block_network") is False and kw.get("use_egress_proxy") is True and kw.get("proxy_hosts") == ["scan.test"])
     # 6. write without scope refused
-    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1"}, "write", "sh", "-c", "echo x>f")
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "output": "/out/run1"},
+                     "write", "sh", "-c", "echo x>f")
     check("write without writable_paths refused", rc == 3 and any("writable_paths" in r for r in out.get("reasons", [])))
     # 7. write with scope authorized + scoped, still no network
-    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "writable_paths": ["/out/run1"]},
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "output": "/out/run1",
+                      "writable_paths": ["/out/run1"]},
                      "write", "sh", "-c", "echo x>/out/run1/f")
     kw = out.get("sandbox_kwargs", {})
     check("write with scope authorized + scoped", rc == 0 and kw.get("writable_paths") == ["/out/run1"] and kw.get("block_network") is True)
@@ -60,7 +62,8 @@ def main():
     check("unknown capability in grant refused", rc == 3 and any("unknown capabilities" in r for r in out.get("reasons", [])))
     # 9. least privilege: grant network+write, require network only -> no writes relaxed
     rc, out, _ = run({"capabilities": ["network", "write"], "authorization_source": "u1",
-                      "writable_paths": ["/out"], "proxy_hosts": ["h.test"]}, "network", "curl", "http://h.test/")
+                      "output": "/out", "writable_paths": ["/out"], "proxy_hosts": ["h.test"]},
+                     "network", "curl", "http://h.test/")
     kw = out.get("sandbox_kwargs", {})
     check("least-privilege relaxes only what's required",
           "writable_paths" not in kw and out["decision"]["capability_scope"]["write"] is False)
@@ -72,6 +75,32 @@ def main():
     rc, out, _ = run(GRANT, "network", "curl", "http://scan.test/", exec_=True, env=env)
     check("--exec refuses when core.sandbox unavailable",
           rc == 3 and out.get("executed") is False and any("unsandboxed" in r for r in out.get("reasons", [])))
+
+    # 12. HARDENING — an unanchored grant cannot produce a plan at all. Without target/output the
+    # sandbox never engages filesystem isolation, so a "sandboxed" run had unrestricted writes.
+    rc, out, _ = run({"capabilities": ["network"], "authorization_source": "u1",
+                      "proxy_hosts": ["h.test"]}, "network", "curl", "http://h.test/")
+    check("grant with no target/output ANCHOR refused",
+          rc == 3 and any("unrestricted writes" in r for r in out.get("reasons", [])))
+    # 13. HARDENING — strictness is not the grant's to opt out of
+    rc, out, _ = run(GRANT, "", "./poc")
+    kw = out.get("sandbox_kwargs", {})
+    check("plan is strict + read-restricted + fake-home by default",
+          kw.get("profile") == "strict" and kw.get("restrict_reads") is True and kw.get("fake_home") is True, kw)
+    # 14. HARDENING — a grant cannot downgrade strictness by asking
+    rc, out, _ = run({**GRANT, "profile": "none", "restrict_reads": False, "fake_home": False}, "", "./poc")
+    kw = out.get("sandbox_kwargs", {})
+    check("grant cannot downgrade profile/restrict_reads/fake_home",
+          kw.get("profile") == "strict" and kw.get("restrict_reads") is True and kw.get("fake_home") is True, kw)
+    # 15. HARDENING — a "scoped" write outside the anchor is not scoped
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "output": "/out/run1",
+                      "writable_paths": ["/out/run1", "/etc"]}, "write", "sh", "-c", "echo x>/etc/p")
+    check("writable path outside the anchor refused",
+          rc == 3 and any("outside the declared output/target" in r for r in out.get("reasons", [])))
+    # 16. HARDENING — escaping the anchor with .. is refused
+    rc, out, _ = run({"capabilities": ["write"], "authorization_source": "u1", "output": "/out/run1",
+                      "writable_paths": ["/out/run1/../../etc"]}, "write", "sh", "-c", "echo x")
+    check("writable path escaping the anchor via .. refused", rc == 3)
 
     print(f"\n{passed} passed, {failed} failed")
     return 1 if failed else 0
