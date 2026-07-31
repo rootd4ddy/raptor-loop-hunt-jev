@@ -839,8 +839,14 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   idiomatic subsystems, Rust, or C++ whose ownership is already mechanically encoded by idiomatic RAII.
 
   **Invocation.** There is no `/understand --study` dispatcher flag; drive the libexecs directly from a
-  RAPTOR-launched trusted session into a unique, loop-owned study directory outside the target tree —
-  never the `/audit` output directory, and do not give it an `understand_*` name:
+  RAPTOR-launched trusted session into a unique, loop-owned study directory outside the target tree.
+  Three placement rules, and they are load-bearing — each one blocks one branch of the `/audit`
+  bridge's `_find_domain_model` search, which is live code (see Consumption below), so breaking any of
+  them silently activates the bridge this methodology deliberately keeps shut:
+  - never the `/audit` output directory, nor its parent (blocks `out_dir/` and `out_dir.parent/`);
+  - never a project-level `concepts/domain-model.json` — that path is checked **first**, ahead of
+    every other candidate, and no naming discipline protects you from it;
+  - do not give the study directory an `understand_*` name (blocks the sibling-run search).
   ```bash
   STUDY_DIR="$(mktemp -d "$OUTPUT_DIR/study-memory.XXXXXX")"
 
@@ -863,11 +869,14 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   / target root, consume nothing; partial study output is not a lead. Record the target identity, scope,
   and `$STUDY_DIR` in `TRIED.md` as a non-coverage generator attempt.
 
-  Read `domain-model.json` yourself. Do **not** rely on `/audit` picking it up: the intended
-  free-via-`/audit` path is dead code in the current RAPTOR checkout, nothing imports this model into
-  loop-hunt automatically, and the dormant bridge is unsafe to enable because an `inferred` invariant
-  can bypass `/audit`'s tool-evidence gate. That is why this model remains isolated and may feed only
-  the candidate-source seat below.
+  Read `domain-model.json` yourself, and do **not** rely on `/audit` picking it up. The bridge
+  (`core/concepts/audit_bridge.py`) is **live and importable, not dead** — `core/audit/collector.py`
+  calls `_find_domain_model(out_dir)` on an ordinary path. What keeps it inert is *only* the placement
+  discipline above: it is dormant because nothing puts a `domain-model.json` where it looks, not
+  because the code is absent. Treat that as a convention you must uphold, not a property you inherit —
+  enabling it is unsafe because an `inferred` invariant would bypass `/audit`'s tool-evidence gate.
+  Nothing imports this model into loop-hunt automatically, and it may feed only the candidate-source
+  seat below.
 
   **Consumption.** Import no model claim directly. For each invariant, resolve `invariant.concept` to
   its `concepts[]` entry — citeable evidence is not reliably carried on the invariant itself in the
