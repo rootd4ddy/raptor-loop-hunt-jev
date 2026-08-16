@@ -157,8 +157,10 @@ LLM round and don't spend inference rediscovering what they already know:
   separate claim needing `--binary-edges` or a source call graph.
   - **`--no-binary-oracle` is `/codeql` and `/audit` only.** `/agentic` never registered it (its own
     argparse block declares `--binary`, `--binary-auto`, `--binary-edges` and nothing else), so the
-    flag is silently ignored there — `/agentic`'s broad escape hatch is `--allow-unreachable`, which
-    disables *all* reachability suppression, not just this oracle.
+    flag is silently ignored there (worse: `/agentic`'s own code reads and recommends the flag it never
+    registered) — `/agentic`'s escape hatch is `--allow-unreachable`, which bypasses the reachability
+    *suppression* chokepoint wholesale, not just this oracle. It does not stop binary auto-detection or
+    inventory enrichment: the verdicts are still computed and still annotate the inventory.
   - **This is build-specific compilation-survival evidence, not source ground truth.** `--binary` is
     validated as "is a file" and nothing binds it to the current commit, dirty tree or build config,
     so a stale or partial binary can hard-suppress live source findings. Treat a verdict as evidence
@@ -171,9 +173,43 @@ LLM round and don't spend inference rediscovering what they already know:
     `symbol_only`-never-demotes rule and the two-signal gate.
   - **The oracle is not the only pre-LLM kill.** `module_aborts` and `lexical_dead` are also
     suppression-eligible structural witnesses, and `/agentic` deterministically marks test fixtures
-    `clean` and skips the LLM entirely, with no CLI switch to disable it. "Binary `absent` is the one
-    permitted hard-suppressor" is this methodology's *policy*, not the framework's behaviour — import
-    every fixture/structural suppression as an `open` candidate unless a loop-owned receipt backs it.
+    `clean` and skips the LLM entirely, with no CLI switch to disable it. `/audit`'s small-function
+    batch path has its own gate: a function hitting `_dead_code_reason` is committed `dormant` with
+    `evidence_tool="reachability:dead_code"` **without any LLM review at all**. "Binary `absent` is the
+    one permitted hard-suppressor" is this methodology's *policy*, not the framework's behaviour —
+    import every fixture/structural suppression as an `open` candidate unless a loop-owned receipt
+    backs it.
+- **CodeQL on C/C++ is BUILDLESS by default — its negatives are scope-limited.** RAPTOR now creates
+  C/C++ databases with `codeql database create --build-mode=none`, so the untrusted repo's build
+  scripts never execute; detected build commands are ignored unless traced extraction was explicitly
+  selected, and a CodeQL CLI older than 2.16 **fails the create** rather than silently falling back to
+  a traced build. Traced extraction is opt-in — `--traced-build`, or an explicit per-language
+  `--build-command` — and is **deliberately independent of `--trust-repo`**: trusting the repo buys you
+  no traced build, and a traced run still refuses on unsafe CodeQL pack config. The cost is coverage:
+  build-generated headers are invisible. RAPTOR surfaces this, but weakly — the logged number is a
+  **regex count of extractor-diagnostic lines mentioning unresolved includes**, it collapses to zero on
+  a parse failure, zero prints a generic warning with no number, the summary runs **only after a fresh
+  successful create** (a cached database returns before it), and the count is never persisted into
+  database metadata. **Consequence for this loop:** a "CodeQL found nothing here" receipt on a C/C++
+  target must record whether extraction was buildless or traced and, when buildless, retain the
+  original creation log (or an independently captured extractor-diagnostic inventory). A zero or a
+  missing count is not proof that headers resolved. Without that provenance the sweep is partial
+  coverage presented as complete — the same fraud class as a capped rule sweep. Other languages are
+  unaffected.
+- **`/scan` can silently lose registry rule packs.** The Semgrep preflight opens a 3-second TCP probe
+  (to the configured HTTPS proxy's first hop when one is set, else `semgrep.dev:443`); on failure it
+  logs a warning, **drops every uncached registry pack**, and scans on with what remains — exiting 0.
+  A `/scan` receipt must carry the resolved pack list, the applicable-rule count, and any
+  "dropping uncached registry pack(s)" warning. A clean exit after pack-dropping is not a full sweep.
+- **Project trust markers change later runs — announced, but easy to miss.** `/project trust
+  config|build|dynamic` (`libexec/raptor-project-manager trust <marker>`) persists an operator assertion that RAPTOR applies to **every subsequent run**:
+  `config` → `--trust-repo` and `build` → `--traced-build` for `/agentic` and `/codeql`; `dynamic` →
+  dynamic validation for `/audit`. Direct `/scan` does **not** consume them (only flags forwarded from
+  `/agentic` or `/codeql` carry that state). Precedence is explicit-negative > explicit-positive >
+  marker > off, and RAPTOR prints a one-line banner whenever a marker actually affected the run — so
+  this is visible, not silent, provided you read it. Record the effective flags **and** the active
+  marker set per round in `TRIED.md`: flipping a marker mid-engagement re-characterises the provenance
+  of every receipt that follows it.
 - **Target's OWN known vulns + upstream fixes (prior-art recon) — MANDATORY, not optional.** Pull
   the TARGET application's history, not just its dependencies, BEFORE the LLM loop:
   - **Its CVE/GHSA record** — OSV (`POST https://api.osv.dev/v1/query` `{"package":{"name":..,"ecosystem":..}}`),
@@ -395,14 +431,25 @@ unowned/corrupt store; writes are atomic + locked + fsynced; the inbox is race-f
 lock; synthesize rotates it aside before folding). Schema + `learnings.jsonl` grammar: `references/kb-schema.md`.
 
 **Enable trajectory capture.** Pass the run's output directory to every `/understand` and `/cve-diff`
-call so trajectories accumulate — the FLAG is what sets the location, and the flag name differs per
-command: `/understand --out "$OUTPUT_DIR"`, `/cve-diff --output-dir "$OUTPUT_DIR"` (`--out` is not a
+call — the FLAG is what sets the location, and the flag name differs per command:
+`/understand --out "$OUTPUT_DIR"`, `/cve-diff --output-dir "$OUTPUT_DIR"` (`--out` is not a
 `/cve-diff` flag and is rejected). Exporting `RAPTOR_TRAJECTORY_DIR` yourself is a **no-op**: both
 libexecs assign `os.environ["RAPTOR_TRAJECTORY_DIR"]` from their own resolved output dir, overwriting
-whatever you exported.
+whatever you exported. But the flag only sets the *location* — it does not guarantee a trajectory.
 
-`/understand --hunt`, `/understand --trace`, and `/cve-diff` persist automatically. (`/agentic` does not persist
-trajectories; for that stage `reflect` simply has no input and the steering records come from adjudication.)
+**A trajectory is written only by an agent tool-use loop, and `/understand` reaches one on a minority
+of its routes.** `/cve-diff` opts its agent loop in under `--output-dir`. `/understand` is mode-routed
+(`dispatch: skill`): source-tree `--map`, `--hunt`, `--trace`, `--teach` and `--study` run **in-session**
+(you are the LLM) and write lifecycle and result artifacts — `variants.json`, `context-map.json` — but
+**no trajectory**; the libexec rejects source-tree `--map` and refuses `--hunt` / `--trace` without
+`--model`. Even on the libexec path only the LLM hunt/trace loop persists: with `--hunt-tool auto` (the
+default) a C/C++ target with `spatch` on PATH selects the **Coccinelle** backend, which makes one
+rule-writing model call and no tool-use loop; binary `--map` sets the env var but never runs one either.
+So for a hunt trajectory pass **`--model <name> --hunt-tool llm`**, and keep the Coccinelle rule + match
+output as a *mechanical sweep artifact* when `auto` picks that backend instead. Verify by existence:
+no `trajectories/<run_id>/trajectory.json` means **no `reflect` input** for that round — never assume the
+record landed. (`/agentic` does not persist trajectories either; for that stage `reflect` has no input
+and the steering records come from adjudication.)
 
 ## Stop condition — loop until dry, not literally forever
 
@@ -834,7 +881,10 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
 - **Pre-map first:** `/understand --map <target>` to enumerate entry points, trust
   boundaries, and sinks — this seeds the whole-project and functionality altitudes.
 - **Sink-class sweeps:** `/understand --hunt <pattern>` per dangerous sink class (shell-exec,
-  strcpy/format-string, crypto-compare, file-syscall, deserialization). One hunt per class.
+  strcpy/format-string, crypto-compare, file-syscall, deserialization). One hunt per class. Without
+  `--model` the hunt runs **in-session** (it may still write `variants.json`, but no trajectory); with
+  `--model` on a C/C++ target the default `--hunt-tool auto` may pick the Coccinelle backend instead of
+  the model loop. Pass `--model <name> --hunt-tool llm` when you want the model's tool-use record.
 - **Semantic-invariant candidate source (opt-in, gated).** For bug classes whose violation has *no
   adequate generic sink signature* — ownership transfer, lifetime/refcount, aliasing, RCU/lock-protected
   lifetime, one-shot state transitions, omitted-cleanup contracts — the sink sweeps above are not
@@ -842,8 +892,9 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   generation, never as detection, confirmation, refutation, or coverage.
 
   **Gate hard.** Run at most one prep+run pipeline per engagement — no *operator-driven*
-  `raptor-study-loop` and no reading-list follow-up (note `/audit` spawns `raptor-study-loop` for you,
-  unbounded and un-gated — see Consumption; budget for it) — and only when ALL hold: (1) C/C++ target; (2) pre-map has selected one
+  `raptor-study-loop` and no reading-list follow-up (note that on a C/C++ target `/audit` runs its own
+  incremental study for you, under a scope you did not choose — see Consumption; budget for it) — and
+  only when ALL hold: (1) C/C++ target; (2) pre-map has selected one
   explicit, bounded hot scope: a single file or strict-descendant subsystem directory whose canonical
   path and selection reason are recorded in `TRIED.md`, never the target/repository root, a union of
   disconnected directories, a dependency excluded by the deterministic layer, or an unbounded fan-out;
@@ -860,8 +911,13 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   skip. It is not worth the cost for injection, format-string, path-traversal, known-CVE variants, small
   idiomatic subsystems, Rust, or C++ whose ownership is already mechanically encoded by idiomatic RAII.
 
-  **Invocation.** There is no `/understand --study` dispatcher flag; drive the libexecs directly from a
-  RAPTOR-launched trusted session into a unique, loop-owned study directory outside the target tree.
+  **Invocation.** A `/understand --study` route now exists, but it is an **in-session workflow**: it runs
+  the mechanical prep and then has the *current model* hand-write `domain-model.json`, explicitly skipping
+  `raptor-study-run`. It can still land in a loop-owned `--out` directory — the objection is provenance,
+  not placement: a hand-authored model has no automated extraction record behind it. Drive the libexecs
+  directly from a RAPTOR-launched trusted session into a unique, loop-owned study directory outside the
+  target tree; use the routed workflow only if a manually authored domain model is explicitly acceptable
+  for the seat you are filling.
   The placement rules are load-bearing — they exist to keep a `domain-model.json` out of every path
   the `/audit` bridge's `_find_domain_model` searches, which is live code (see Consumption below), so
   breaking one silently activates the bridge this methodology deliberately keeps shut. It checks
@@ -870,7 +926,9 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
     protects you from it;
   - `out_dir.parent/domain-model.json`;
   - `out_dir/domain-model.json` — i.e. never the `/audit` output directory nor its parent.
-  - do not give the study directory an `understand_*` name (blocks the sibling-run search).
+  - (Historical: an `understand_*` directory name used to be caught by a sibling-run scan. That scan has
+    been **removed** from `_find_domain_model` — it broke the stable-hash invariant the staleness check
+    depends on — so the directory name no longer affects discovery. Those three paths are the whole search.)
   ```bash
   STUDY_DIR="$(mktemp -d "$OUTPUT_DIR/study-memory.XXXXXX")"
 
@@ -885,8 +943,17 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   ```
   Here `<target-root>` is the canonical source root used for include resolution, not the hot-subsystem
   path, and `<active-lens-concepts>` is a comma-separated list limited to the active lens. The scripts
-  parse prep as `<target> <output_dir>`, with `--root` and `--concept` on prep, and parse `--model` on
-  run. Do not bypass their `CLAUDECODE` / `_RAPTOR_TRUSTED` guard merely to make the commands run.
+  parse prep as `<target> <output_dir>`; prep also accepts `--identifier <names>` (an identifier-derived
+  mechanical extraction filter — it additionally grep-prefilters files only when the tree exceeds 500
+  source files), `--correlate <a,b>` (study the *relationship* between named identifiers), `--narrow`
+  (skip API-from-header and stem expansion), plus `--include-dir`, `--threads`, `--reading-list`,
+  `--model` and `--force`. For a bounded hot scope prefer `--identifier` + `--narrow` over a broad
+  `--concept`. **Prep uses `parse_known_args`, so a misspelled or unsupported flag is silently ignored
+  rather than rejected** — a typo'd scope flag yields a successful exit over a wider scope than you
+  asked for, which is exactly the failure this gate exists to prevent. Verify the emitted command and
+  the resolved scope in `study-list.json`; a zero exit proves nothing. `raptor-study-run` parses only
+  `--model` and `-v` (RAPTOR's own `study.md` documents a `--max-batches` flag that does not exist).
+  Do not bypass their `CLAUDECODE` / `_RAPTOR_TRUSTED` guard merely to make the commands run.
   `SAGE_ENABLED=false` is load-bearing: directory isolation alone does not prevent study from recalling,
   seeding, or skipping from cross-run SAGE memory. If either command fails, `domain-model.json` is
   missing or malformed, or its resolved `target` / `source_root` does not match the requested hot scope
@@ -896,25 +963,36 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   Read `domain-model.json` yourself, and do **not** rely on `/audit` picking it up.
 
   **The bridge is NOT dormant, and your placement discipline cannot close it.** `/audit` plants a
-  domain model itself: `core/audit/orchestrator.py:2893-2908` auto-spawns `libexec/raptor-study-loop`
-  over the **whole** `config.target_path` into its own `out_dir`, with `_RAPTOR_TRUSTED=1` set for it,
-  whenever a `reading-list.json` exists. `core/concepts/study.py` then writes `domain-model.json`
-  right where `_find_domain_model` looks. Your rules govern only the study directory *you* create.
-  Three consequences, all live and none opt-out-able (there is no `--no-study` flag, and
-  `OrchestratorConfig` has no study field):
+  domain model itself — by a different mechanism than it used to. It **no longer spawns
+  `raptor-study-loop`**. It starts an incremental **study-consumer thread** (`_study_consumer`) which
+  subprocess-spawns `libexec/raptor-study-prep <study_root or target_path> <out_dir> [--reading-list …]
+  [--model …]` with `_RAPTOR_TRUSTED=1`, then runs study **in-process** via `core.concepts.study.run_study`.
+  `core/concepts/study.py` writes `domain-model.json` right where `_find_domain_model` looks. Your rules
+  govern only the study directory *you* create. There is still no `--no-study` flag; `OrchestratorConfig`
+  now *does* carry a `study_root` field, but no operator CLI sets it (only the corpus harness does).
+
+  **Know the real gates before you budget for it.** The thread starts only when the **post-batching**
+  normal workqueue still contains C/C++ items and `out_dir` is set — so on a non-C/C++ target it never
+  starts, and raising `--batch-sloc-threshold` can move every small C function out of the workqueue and
+  suppress it by accident. Starting the thread is not a study: a normal LLM review must first emit a
+  reading-list question, the request must survive dedup and the time/cost budget, and prep + run must
+  both succeed. And `study_root` sets the *search root*, not the extraction set — prep normally scopes to
+  the reading-list source files plus a bounded include chase, falling back to a full recursive scan only
+  when that scoping fails. Three consequences, all live and none opt-out-able:
   - **`/audit` re-reviews and REPLACES its own verdicts using that model.**
-    `_re_review_study_enriched` swaps the prior outcome out when the status changes
-    (`orchestrator.py:8386-8390`, `result.outcomes[idx] = outcome`). A `finding` can become `clean`
-    with **no tool involvement at all** — the exact "model content may never downgrade a candidate"
-    rule below, violated inside the tool.
+    `_re_review_study_enriched` swaps the prior outcome out **when the status changes**
+    (`result.outcomes[oi] = outcome`). A `finding` can become `clean` with **no tool involvement at
+    all** — the exact "model content may never downgrade a candidate" rule below, violated inside the
+    tool.
   - **`inferred` invariants arrive as assertions of fact.** `primers_from_domain_model`
-    (`audit_bridge.py:348`) filters on relevance only — `s > 1.0` — never on confidence, and then
-    tells the reviewer "*These invariants were extracted from this codebase by /understand --study.
-    A violation is a real bug*" (`audit_bridge.py:354`). Your `{traced, corroborated, tested}`
-    allowlist binds only **your** reading of the model; RAPTOR's own consumer applies no such filter.
-  - **The one-pass-per-engagement study budget is already spent** by that auto-spawn, and spent
-    badly: it runs over the whole target rather than a bounded hot scope, so it fails gate (2) by
-    construction.
+    (`core/concepts/audit_bridge.py`) filters on relevance only — `score > 1.0` — never on confidence,
+    and then tells the reviewer "*These invariants were extracted from this codebase by
+    /understand --study. A violation is a real bug*". A top-5 cap applies to the top-level-invariant
+    primer only; the function as a whole has no hard cap and no confidence gate anywhere. Your
+    `{traced, corroborated, tested}` allowlist binds only **your** reading of the model; RAPTOR's own
+    consumer applies no such filter.
+  - **On a C/C++ target, assume the one-pass-per-engagement study budget is spent** — and spent under a
+    scope you did not choose. On a non-C/C++ target it is not spent at all, and gate (6) is still yours.
 
   **Operational rule.** Treat any `/audit` outcome as untrusted for *dismissal* when its journal
   entry carries a non-empty `invariants_available`, `domain_concepts_available`, or
@@ -940,6 +1018,21 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   and call-path context, but never the domain-model statement, negation, description, evidence
   observations, ID, confidence, role, model-selected conclusion, or generator summary.
 
+  **Compiled invariants — a rule you can re-run, NOT a validated invariant.** RAPTOR can compile a
+  domain-model invariant into a Semgrep or Coccinelle rule (`libexec/raptor-compile-invariants <out_dir>
+  [--model <m>] [--target <t>] [--engine semgrep|coccinelle] [--min-confidence <grade>] [--max N]`), and
+  `/audit` pre-screens with any rules already compiled. Read what "dual control" actually proves: the LLM
+  authors the rule **and** both fixtures, and the check is only that the model's rule matches the model's
+  positive fixture and misses the model's negative one. That is executable self-consistency — not
+  semantic truth, not independence, and not corroboration of the invariant. Two traps: `--min-confidence`
+  compares against the grade order `inferred < observed < traced < corroborated < documented < tested`,
+  so the default `traced` **admits `documented`**, which this methodology's allowlist discards — filter
+  the model yourself before compiling rather than leaning on the flag; and the pass is capped (10
+  invariants compiled, 50 sweep matches), so its silence is never an absence claim. What it does buy is
+  real and new: a **re-runnable mechanical instrument** you can read, sanity-check, and re-execute
+  yourself through a receipt-producing path over the engagement scope. The receipt comes from your
+  re-run, its hits are leads, and a non-matching rule refutes that rule under its exact scope only.
+
   Model content — including a `role="guard"` invariant — may never confirm, downgrade, reject,
   deduplicate, or suppress a candidate. Finding enforcement in one path does not refute omission in
   another; absence from the model proves nothing; an empty or failed study proves nothing. Study may add
@@ -951,7 +1044,20 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   strategy and budget filters. (Scanner file-coverage shifts *priority* in that set; it is not
   subtracted from it, so this is not "everything `/scan` missed".) For functions that reach LLM
   review it forms a hypothesis and may invoke Semgrep / Coccinelle / CodeQL / SMT / Joern when
-  one applies and is available. It occupies the same *generator role* the Semgrep anchors do —
+  one applies and is available. That menu has grown — Joern guard-dominance and `reachableByFlows`
+  channels, flow-sensitive Coccinelle SmPL templates (use-after-free, double-free, double-fetch,
+  unchecked-return-before-deref), a sandboxed compiler-analyzer sweep (`gcc -fanalyzer` / `clang
+  --analyze` over a single TU, never a build system), early refutation gates, and a preprocessor view
+  that recovers macro-defined functions into the checklist — **but the channels do not share one
+  failure semantics, and the distinctions are the whole point.** No Joern binding or no live server is
+  `skipped`; a bound function or endpoint missing from a live CPG is `inconclusive`; a query failure is
+  `error`. A compiler build failure and an unbound Coccinelle identifier are non-refuting. Macro
+  recovery is best-effort and capped at 50 translation units, and the compiler verifier reads only a
+  `line_start .. line_start+50` window — so its negative on a long function is silently partial. Most
+  importantly, **the refutation gates are not all mechanical**: the architecture gate treats the
+  study-produced threading model as authoritative enough to demote a race to `clean`, and the contract
+  gate can demote on keyword-matched domain-model provenance. A disposition those gates touched is a
+  model claim, not a tool result. It occupies the same *generator role* the Semgrep anchors do —
   high noise, by design — and **inherits that seat's rule verbatim: an `/audit` `finding` is a
   lead, not a finding.** It must be **imported into** the same finding contract and put through
   the same from-raw judge as any other candidate; nothing imports it automatically today.
@@ -975,6 +1081,43 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   - **`clean` never counts** — not even receipted. It can come from a triage or prefilter
     short-circuit (triage fires before the function's source context is even built). A negative
     rule says nothing about the cell's other hypotheses or bug classes. Receipts or `UNCOVERED`.
+  - **`verification_tier=tool-backed` on a `clean` is DISPATCH-derived, not success-derived.** The tier
+    is computed from the tool-chain's *planned* step types, which are recorded before the chain runs:
+    a `clean` whose tools were unavailable, skipped, inconclusive or errored still reads `tool-backed`.
+    Never import the tier label — import the per-tool execution result, and close a cell only on a
+    completed, scope-bounded negative predicate.
+  - **Its review unit is not one function per call in every path, and not every item kind.** Two or more
+    functions at or under `--batch-sloc-threshold` SLOC (**default 15**) in the same file are routed to
+    a batch path. Contrary to RAPTOR's own CLI help ("combined reviews"), the implementation still makes
+    **one LLM call per function** — the batch only injects sibling names and line ranges as context and
+    stamps each journal entry `batch: true`. Pass `--batch-sloc-threshold 0` to stay on the normal path;
+    note the coupling, in both directions, that this also keeps small C/C++ functions in the workqueue
+    that gates the study consumer above. Item kinds default to `function`, `method` and legacy
+    empty-kind; **top-level code, explicit macro bodies and globals are never reviewed** unless
+    `--include-kinds top_level,macro,global` is passed — those are `UNCOVERED` cells and nothing it
+    emits says so. (Macro-defined functions recovered by the preprocessor view arrive as
+    `kind: function` and are included, subject to the 50-TU cap.)
+  - **It can now carry dynamic evidence — that still is not a loop receipt.** `--dynamic` /
+    `--no-dynamic` (and the project `dynamic` trust marker) gate sanitizer/crash and Frida validation of
+    `finding`-status outcomes, and `dynamic:sanitizer`, `dynamic:crash`, `frida:runtime`,
+    `dark_verify:*` are valid `evidence_tool` stamps. Read them narrowly: `dynamic:crash` means only
+    *nonzero exit without a sanitizer hit*, yet the tier calculation counts it `confirmed`; and
+    `dark_verify` is a separate post-loop pass that runs unconditionally, not something `--dynamic`
+    controls. The exported record carries the stamp but none of the loop receipt schema — no
+    `oracle_class`, no operator-defined predicate, no exact input, no target/tool or observed-artifact
+    hashes. Import as a **prioritised lead** and re-run the loop's own live verifier.
+  - **Git-history corroboration is not a tool result.** The local git-history oracle attaches prior
+    security-fix records to `finding` / `suspicious` entries and is verdict-impossible by construction —
+    no `outcome` field, and its stamps can never satisfy `is_tool_evidence` (empty corroboration when
+    the local history is missing or the hardened query fails). Read it as recheck **priority** — it is a
+    good post-fix-variant lead — never as a receipt.
+  - **An `evidence_tool` stamp is namespace recognition, not receipt validation.** `is_tool_evidence`
+    takes the root before the `:` and accepts **any** suffix under a recognised namespace — so
+    `semgrep:anything`, `dynamic:anything`, `critique:anything`, `dark_verify:anything`, and the bare
+    namespaces `prefilter`, `sweep`, `sarif_cache` and `triage` all pass. Only `llm-claimed:` is
+    reliably excluded. "It has a tool stamp" therefore means nothing on its own: require the underlying
+    command, its scope, its exit status, the machine predicate and the observed artifacts, or treat the
+    record as an LLM claim wearing a tool-shaped name.
   - **`dormant` is a label.** Import as `open`. `/audit`'s own G7 requires zero static callers
     AND `absent` AND full DWARF, but its run path demotes on a name-keyed `absent` alone. A fresh
     loop-owned verifier may use the full two-signal form as reachability *evidence*; `symbol_only`
@@ -1008,8 +1151,9 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
 
   Ignored, these compound: history biases the review toward `clean` or drops the function below
   the budget cutoff, accumulated cross-run records let its component read as covered anyway, and
-  since `/audit` has no `needs-live-validation` state a server-dependent survivor has nowhere to
-  sit but `clean` or `dormant` — a clean-looking closure gate over a component nobody hunted.
+  `/audit` still has no `needs-live-validation` status — `--dynamic` adds an *evidence stamp*, not a
+  disposition, so a server-dependent survivor whose validation did not fire still has nowhere to sit
+  but `clean` or `dormant` — a clean-looking closure gate over a component nobody hunted.
 - **The main engine:** `/agentic --understand --validate --max-findings <N>` with multiple `--model`
   flags — each is an independent, isolated reasoner (there is no `--independent` toggle; parallelism
   *is* the independence) — plus `--judge` (generate-then-refute) and `--consensus` / `--aggregate`
@@ -1099,6 +1243,16 @@ for k in OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY; do
   [ -n "${!k}" ] && echo "available: ${k%_API_KEY}"
 done
 ```
+
+**A missing key does not mean in-session execution.** With no explicit model, RAPTOR's mode resolver can
+select the Claude Code CLI transport from the configured default/fallback, live-preflight it, and enter
+orchestrator mode on success — so "no second vendor keyed" is a statement about API keys, not about which
+model actually answered. Record, per seat: provider, requested model, the response's `resolved_model`,
+`RAPTOR_CC_FALLBACK_MODEL` (the CLI can silently retry on a different backend model when overloaded),
+`RAPTOR_CC_EFFORT`, and the per-call budget (`RAPTOR_CC_BUDGET_USD`, default USD 5 per call, separate
+from run budgets). Transport liveness and model identity never upgrade a model claim into a receipt —
+but a judge seat you *believed* was cross-vendor and wasn't invalidates the independence the two-reasoner
+split is buying.
 
 Then wire `/agentic`. Model ids are `provider/model` and must name a **concrete configured model**
 — `provider/default` is NOT a sentinel: the resolver strips the provider and builds an entry whose
