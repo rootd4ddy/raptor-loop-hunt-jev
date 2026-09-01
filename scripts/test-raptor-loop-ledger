@@ -55,6 +55,28 @@ def vmatrix(tested=("body",), observed="param bound, no structure change", omit=
                          "rationale": f"{v} does not reach this sink on this route"})
     return rows
 
+
+def handoff(scope="exact-target", equivalence=None, author_assistance=False,
+            marker_passed=True, control_passed=True):
+    equivalence = equivalence or scope
+    return json.dumps({
+        "reviewer": "fresh-reviewer-1",
+        "reviewer_independent": True,
+        "package_digest": "sha256:poc-package",
+        "environment_digest": "sha256:clean-environment",
+        "instructions_artifact": "README.md#sha256:instructions",
+        "author_assistance": author_assistance,
+        "claim_scope": scope,
+        "target_equivalence": equivalence,
+        "success_marker": {"expected": "marker file contains RAPTOR_OK",
+                           "observed": "marker file contains RAPTOR_OK" if marker_passed else "marker absent",
+                           "passed": marker_passed},
+        "negative_control": {"expected": "patched/control build does not create marker",
+                             "observed": "marker absent" if control_passed else "marker present",
+                             "passed": control_passed},
+        "observed_artifacts": ["handoff/run.log#sha256:abc"],
+    })
+
 def main():
     tmp = os.path.realpath(tempfile.mkdtemp(prefix="ledger-test-"))  # macOS /var,/tmp are symlinks
     target = os.path.join(tmp, "target"); os.makedirs(target)
@@ -634,6 +656,119 @@ def main():
               out.get("conformance"))
         check("D-unused-ledger an uninitialised ledger is flagged",
               "ledger_never_initialised" in out.get("failures", {}))
+
+        # =============== FRESH-OPERATOR / INTERVENTION EXTENSION =========================
+        # This axis is intentionally orthogonal to technical closure. `report_blocking` remains
+        # about finding work; `delivery_blocking` is the owner-handoff quality gate.
+        L5 = ["--ledger", os.path.join(tmp, "out", "ledger5")]
+        run("init", *L5, "--target", target)
+        _, s5, _ = run("summary", *L5)
+        check("handoff: no review starts delivery blocked without blocking technical reporting",
+              s5.get("delivery_readiness") == "blocked" and s5.get("delivery_blocking") is True
+              and s5.get("report_blocking") is False)
+
+        bad_intervention = {"stage": "setup", "unexpected_condition": "dependency missing",
+                            "intervention": "installed it", "classification": "documentation-defect",
+                            "evidence": ["setup.log"]}  # required booleans deliberately absent
+        rc, out, _ = run("intervention", *L5, "--target", target,
+                         "--record", json.dumps(bad_intervention))
+        check("handoff: structurally incomplete intervention REFUSED",
+              rc == 3 and out.get("intervention") == "REFUSED")
+
+        docs_intervention = {"stage": "setup", "unexpected_condition": "required package absent",
+            "intervention": "installed package manually", "classification": "documentation-defect",
+            "documented_before_run": False, "required_for_success": True,
+            "changed_target_semantics": False, "changed_security_controls": False,
+            "operator_knowledge_required": True, "evidence": ["handoff/setup.log:12"]}
+        rc, out, _ = run("intervention", *L5, "--target", target,
+                         "--record", json.dumps(docs_intervention))
+        iid_docs = out.get("intervention_id")
+        check("handoff: required undocumented intervention recorded", rc == 0 and bool(iid_docs))
+
+        rc, out, _ = run("handoff-review", *L5, "--target", target,
+                         "--record", handoff())
+        check("handoff: successful replay still needs documentation while tacit step is unresolved",
+              rc == 0 and out.get("delivery_readiness") == "needs_documentation")
+        rc, out, _ = run("conformance", *L5, "--target", target, "--require-handoff")
+        check("handoff: owner-delivery conformance refuses unresolved workaround",
+              rc == 3 and "delivery_readiness_not_ready" in out.get("failures", {}))
+
+        rc, out, _ = run("intervention-resolve", *L5, "--target", target,
+                         "--intervention", iid_docs, "--record", json.dumps({
+                             "resolution": "documented", "evidence": ["README.md:18"],
+                             "instructions_artifact": "README.md#sha256:new"}))
+        check("handoff: documentation resolution accepted and requires a new cold replay",
+              rc == 0 and out.get("delivery_readiness") == "blocked" and
+              any("predates" in r for r in out.get("blocking_reasons", [])))
+        rc, out, _ = run("intervention-resolve", *L5, "--target", target,
+                         "--intervention", iid_docs, "--record", json.dumps({
+                             "resolution": "documented", "evidence": ["README.md:18"],
+                             "instructions_artifact": "README.md#sha256:new"}))
+        check("handoff: duplicate resolution is refused without overwriting append-only history", rc == 3)
+
+        rc, out, _ = run("intervention-resolve", *L5, "--target", target,
+                         "--intervention", iid_docs, "--record", json.dumps({
+                             "resolution": "eliminated", "evidence": ["handoff/setup-clean.log"],
+                             "verification_artifact": "handoff/setup-clean.log#sha256:fixed"}))
+        check("handoff: later resolution supersedes current state but preserves history",
+              rc == 0 and out.get("delivery_readiness") == "blocked")
+
+        rc, out, _ = run("handoff-review", *L5, "--target", target,
+                         "--record", handoff())
+        check("handoff: uncoached exact-target replay becomes delivery ready after documentation",
+              rc == 0 and out.get("delivery_readiness") == "ready")
+        rc, out, _ = run("conformance", *L5, "--target", target, "--require-handoff")
+        check("handoff: ready receipt clears the delivery-specific conformance failure",
+              "delivery_readiness_not_ready" not in out.get("failures", {}) and
+              "fresh_operator_handoff" in out.get("checks_executed", []))
+
+        semantic_intervention = {"stage": "exploit", "unexpected_condition": "mitigation blocked trigger",
+            "intervention": "disabled the mitigation", "classification": "harness-defect",
+            "documented_before_run": False, "required_for_success": True,
+            "changed_target_semantics": True, "changed_security_controls": True,
+            "operator_knowledge_required": True, "evidence": ["handoff/mitigation.log:4"]}
+        rc, out, _ = run("intervention", *L5, "--target", target,
+                         "--record", json.dumps(semantic_intervention))
+        iid_sem = out.get("intervention_id")
+        check("handoff: later semantics-changing intervention invalidates the earlier ready review",
+              rc == 0 and out.get("delivery_readiness") == "blocked")
+        run("intervention-resolve", *L5, "--target", target, "--intervention", iid_sem,
+            "--record", json.dumps({"resolution": "documented-lab-boundary",
+                "evidence": ["LIMITATIONS.md:7"], "limitations_artifact": "LIMITATIONS.md#sha256:lab"}))
+        rc, out, _ = run("handoff-review", *L5, "--target", target,
+                         "--record", handoff(scope="exact-target", equivalence="declared-lab"))
+        check("handoff: a documented lab modification cannot satisfy an exact-target claim",
+              rc == 0 and out.get("delivery_readiness") == "blocked")
+        rc, out, _ = run("handoff-review", *L5, "--target", target,
+                         "--record", handoff(scope="declared-lab", equivalence="declared-lab"))
+        check("handoff: the same disclosed modification can be ready as a declared lab boundary",
+              rc == 0 and out.get("delivery_readiness") == "ready")
+
+        rc, out, _ = run("handoff-review", *L5, "--target", target,
+                         "--record", handoff(scope="declared-lab", author_assistance=True))
+        check("handoff: author coaching prevents a ready cold handoff",
+              rc == 0 and out.get("delivery_readiness") == "needs_documentation")
+
+        # A v1 engagement ledger upgrades in place on its next write; old runs remain readable.
+        L6 = ["--ledger", os.path.join(tmp, "out", "ledger6")]
+        run("init", *L6, "--target", target)
+        ledger6_path = os.path.join(tmp, "out", "ledger6", "ledger.json")
+        with open(ledger6_path) as f: old = _j.load(f)
+        old["schema_version"] = 1
+        for key in ("interventions", "handoff_reviews", "delivery_revision"):
+            old.pop(key, None)
+        with open(ledger6_path, "w") as f: _j.dump(old, f)
+        rc, out, _ = run("summary", *L6)
+        check("handoff: schema-v1 ledger remains readable", rc == 0 and out.get("intervention_count") == 0)
+        compatible = {"stage": "setup", "unexpected_condition": "informational retry",
+            "intervention": "reran once", "classification": "operator-error",
+            "documented_before_run": True, "required_for_success": False,
+            "changed_target_semantics": False, "changed_security_controls": False,
+            "operator_knowledge_required": False, "evidence": ["run.log:1"]}
+        run("intervention", *L6, "--target", target, "--record", json.dumps(compatible))
+        with open(ledger6_path) as f: upgraded = _j.load(f)
+        check("handoff: schema-v1 ledger persists as schema v2 on the next write",
+              upgraded.get("schema_version") == 2 and upgraded.get("delivery_revision") == 1)
 
         print(f"\n{passed} passed, {failed} failed")
         return 1 if failed else 0

@@ -1,18 +1,14 @@
 ---
 name: raptor-loop-hunt
 description: >-
-  Autonomous, looping, multi-altitude security vulnerability hunt for a codebase — the RAPTOR
-  "Karpathy auto-research" methodology that finds far more bugs than a single-pass scan. Make
-  this the default whenever the user points you at source code (a repo, service, app, module,
-  or directory) and wants vulnerabilities found: any request to audit, pentest, or
-  security-review it, or to "find bugs" / "find anything exploitable". Depth and coverage cues
-  strengthen the match — "go deep", "find every bug", "exhaustively audit", "maximum coverage",
-  "keep hunting until you've got them all", "don't stop after the first pass", "verified not
-  guessed", "auto-research", "file by file / function by function" — but a plain "audit this
-  codebase for security" already qualifies; users rarely name the looping, generate-then-judge
-  discipline that is the actual value. Do NOT use for webserver/config-file audits, reproducing
-  a single known CVE, a one-file or one-function sanity check, dependency/SCA CVE lookups, PR or
-  style review, debugging one specific crash, or only mapping attack surface without hunting.
+  Autonomous, looping, multi-altitude security vulnerability hunting for source code using RAPTOR's
+  inventory-first generate-judge-verify methodology. Use by default when the user points to a repo,
+  service, app, module, or directory and asks to audit, pentest, security-review, find bugs, or find
+  anything exploitable. Depth cues such as go deep, find every bug, exhaustive, maximum coverage,
+  keep hunting, verified not guessed, auto-research, or file/function-by-function strengthen the
+  match, but a plain source-code security audit also qualifies. Do not use for webserver/config-only
+  audits, one known-CVE reproduction, a one-file/function sanity check, dependency/SCA lookup, PR or
+  style review, debugging one specific crash, or attack-surface mapping without vulnerability hunting.
 ---
 
 # RAPTOR Auto-Research Vuln Hunt
@@ -645,6 +641,8 @@ mechanical tell:
 | Dropped pending/inconclusive | The report omits candidates still `open` / `needs-live-validation`, reading as done while work is outstanding. |
 | Skip counted as review | A cell marked covered off an `/audit` record whose `status=clean` carries `evidence_tool=triage` or `prefilter` — no rule ran, no loop-owned hunt receipt. Triage can fire before the source context is built; prefilter is a bounded heuristic, not a hypothesis-directed hunt. The tell is that pairing in `.audit-log.jsonl` with no receipt joined to it. |
 | Capped or completeness-unknown sweep sold as complete | A rule sweep used as the discovered-site denominator when completeness is not *positively* established — `capped=true`, or `complete≠true`, or `total_matches` absent, or no re-runnable site-set hash. A hit count landing exactly on a known cap is a mandatory re-run trigger, not proof on its own; and absence of a cap flag proves nothing, because the `/audit` adapter drops it and replayed rules never set it. Fail closed. |
+| Tacit workaround sold as reproduction | The author needed an undocumented retry, dependency, privilege/config change, remembered path, disabled control, or manual repair, but no intervention + resolution receipt exists. |
+| Author-coached handoff sold as owner-ready | The PoC works only while its author supplies missing steps, or the latest handoff predates a newly discovered intervention. `delivery_readiness` is recomputed and cannot be `ready`. |
 
 ## Guardrails (where this methodology bites back)
 
@@ -774,6 +772,29 @@ invariant-assert for lifecycle, differential for logic, authz-trace for access c
 crash. A single non-repro of a timing / lifecycle bug is a false-negative until proven; record
 unexamined cells as *unknown*.
 
+## Fresh-operator handoff — remove tacit researcher knowledge
+
+A clean reset removes hidden machine state; it does not remove the author's learned retries, setup
+tricks, remembered paths, disabled controls, or manual repairs. For every PoC/lab/retest bundle
+intended for an application owner, use the **G5b fresh-operator extension** in
+`references/handoff-reproducibility.md`:
+
+- Record every unintended workaround with `raptor-loop-ledger intervention` when it happens; never
+  normalize it into the procedure after the fact without leaving the observation and resolution
+  receipts.
+- Give an uninvolved reviewer only the immutable package, declared prerequisites, and instructions
+  in a new environment. The author may observe but must not coach.
+- Record the exact success marker, causal negative control, environment/package digests, target
+  equivalence, and artifacts with `handoff-review`.
+- Run owner-delivery closure with `conformance --require-handoff`. A later intervention or resolution
+  invalidates an earlier ready review, so readiness is always recomputed from the full current ledger.
+
+Keep **technical validity** and **delivery readiness** orthogonal. Handoff failure does not erase a
+technically proven finding; it sets `delivery_readiness` to `needs_documentation`,
+`needs_environment_fix`, or `blocked`. A successful handoff does not upgrade weak technical evidence.
+An exact-target claim cannot pass on a semantics- or security-control-changing intervention merely
+because the change was documented; it must be eliminated or proven to match the claimed deployment.
+
 ## Reporting — coverage is exhaustive, the findings list is not
 
 Two things must both be true, and they pull in opposite directions:
@@ -816,6 +837,8 @@ resolve to a ledger fact or a receipt, and surface every mismatch:
 - dirty-file triggers  −  `DIRTY_SWEEP` receipts  → an unswept proven-dirty file.
 - report claims (reachable / default-config / PoC-reproduces / component-covered / vector-tested /
   cross-vendor-decided)  −  the matching log/receipt facts  → a claim with no evidence behind it.
+- for an owner deliverable, the latest cold-handoff review + all intervention/resolution receipts −
+  the `ready` predicate → an author-dependent or semantically altered package sold as reproducible.
 
 Any non-empty diff is a **gate failure**, not an advisory. There is no "PASS with residue" — that
 wording is forbidden, and the gate cannot emit it. The verdict vocabulary is exactly three values:
@@ -835,7 +858,8 @@ comparison is machine set-difference over the ledger, not model interpretation; 
 auditor may investigate the failures the diff surfaces, but must never be the thing responsible for
 *noticing* them. This gate is `raptor-loop-ledger conformance` (exit 3 on any non-empty diff); its
 axes and the trap battery that regression-tests them are in `references/ledger-schema.md` and
-`eval/README.md`.
+`eval/README.md`. Add `--require-handoff` for owner-facing PoC/lab/retest delivery; omit it during an
+exploratory technical-only run so delivery readiness does not silently rewrite candidate verdicts.
 
 ## End-of-run: reflect, append typed outcomes, synthesize (this feeds the next loop)
 
@@ -1185,6 +1209,11 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
   The same typed disposition is also the KB `finding_outcome` at end-of-run — the ledger is the
   disposition-time enforcement, `raptor-loop-kb synthesize` the cross-engagement fold. Schema:
   `references/ledger-schema.md`.
+- **Fresh-operator delivery extension** (`raptor-loop-ledger intervention`,
+  `intervention-resolve`, `handoff-review`, and `conformance --require-handoff`). Use it for every
+  owner-facing PoC/lab/retest bundle. It produces a separate `delivery_readiness` and never mutates
+  the finding's technical state. Full procedure and receipt schema:
+  `references/handoff-reproducibility.md`.
 - **Execution-auth broker for live PoCs** (`scripts/raptor-loop-exec` — self-contained in this
   skill, pure-stdlib authorization). Any acting step a live-validation needs (a network probe, a
   write, running a PoC, using a repo-found credential) declares the capabilities it `--requires`
@@ -1299,7 +1328,12 @@ fan-out), use this template — it is the distilled methodology above:
 > pipeline. Critical: write down everything you try in TRIED.md and read it before each round;
 > dedup against FINDINGS.md and the rejected set **within THIS engagement only** (a fresh clone / new release / changed tree starts a new TRIED.md with every component UNCOVERED; cross-engagement rejected/confirmed history is a KB *recheck annotation*, never an exclusion, and a resurfaced or changed candidate re-enters the full judge + live-verify chain). Live-verify every survivor with a fresh,
 > independent reader (one that did NOT write the finding) re-reading the cited source from raw
-> before it counts. A disposition is a TRANSITION the orchestrator certifies, not a sentence a
+> before it counts. For every owner-facing PoC/lab/retest bundle, record every unintended workaround
+> through `raptor-loop-ledger intervention`, resolve it with evidence, then require an uncoached
+> fresh operator to replay the immutable package and its negative control; record that with
+> `handoff-review` and run final conformance with `--require-handoff`. Keep its derived
+> `delivery_readiness` separate from the technical verdict. A disposition is a TRANSITION the
+> orchestrator certifies, not a sentence a
 > reasoner emits: mark **confirmed** only with a machine-checkable oracle observation (a bare crash
 > is `dos`-class, not memory-corruption RCE); mark **rejected** only after the per-(vector×transform)
 > tests, the gating digests, AND an orchestrator-dispatched cross-vendor kill that did not overturn —

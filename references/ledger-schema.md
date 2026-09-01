@@ -17,7 +17,7 @@ turns each discipline into a receipt the transition *requires*.
 
 ```
 <OUTPUT_DIR>/ledger/
-  ledger.json      # candidates + receipts + pending_actions + cross_vendor_jobs (atomic, locked, fsynced)
+  ledger.json      # candidates + receipts + pending_actions + review jobs + handoff records
   .ledger.lock     # flock file (all writers serialize)
 ```
 
@@ -81,6 +81,30 @@ ledger** — a refused transition leaves it `open`, never dropped. Full `state_h
   `overturn`/`inconclusive`/`uphold` refuses). Miss any → transition fails, candidate stays put, an
   `incomplete_material_downgrade → complete_material_downgrade_bundle` action is enqueued.
 
+## Fresh-operator owner-delivery extension
+
+Schema v2 adds `interventions{}` with append-only resolution history and append-only
+`handoff_reviews[]` to the same locked sidecar.
+These records derive `delivery_readiness` independently of candidate state and `report_blocking`.
+They never confirm, reject, downgrade, or otherwise mutate a technical finding.
+
+- `intervention` records an unintended retry, repair, dependency, privilege/config change, disabled
+  control, target/harness change, or other tacit step with explicit boolean impact fields.
+- `intervention-resolve` appends a resolution receipt: documented, eliminated, deployment-matched,
+  disclosed lab boundary, or accepted blocker. Later evidence may supersede the current resolution,
+  but history is never overwritten.
+- `handoff-review` records an independent operator's package/environment digests, instruction
+  artifact, author-assistance status, target equivalence, exact success marker, negative control,
+  and observed artifacts.
+- `summary` always recomputes `delivery_readiness` from the latest review and every current
+  intervention. A newly recorded intervention or resolution invalidates an earlier review and
+  requires a new replay of the changed package/instructions.
+- `conformance --require-handoff` adds the owner-delivery gate. Without the option, technical
+  conformance remains backward-compatible and delivery readiness cannot rewrite technical truth.
+
+The full schemas, readiness predicates, and examples are in
+`references/handoff-reproducibility.md`.
+
 ## Cross-vendor jobs (the trusted channel)
 
 `raptor-loop-ledger cross-vendor --job '{"model":..,"target":..,"verdict":"uphold|overturn|inconclusive|concur_downgrade","evidence_hash":..}'`
@@ -108,11 +132,16 @@ refused). `file-close --file F` is REFUSED while a `dirty_sweep` for a candidate
 - `init --ledger DIR --target DIR` — create, stamp identity.
 - `add --ledger DIR --target DIR (--record JSON | -)` — register candidate (idempotent by signature; refuses a placeholder/stub record — invalid-cell lint).
 - `cross-vendor --ledger DIR (--job JSON | -)` — record a dispatched review job.
+- `intervention --ledger DIR --target DIR (--record JSON | -)` — record an unintended workaround.
+- `intervention-resolve --ledger DIR --target DIR --intervention I (--record JSON | -)` — append a
+  resolution receipt.
+- `handoff-review --ledger DIR --target DIR (--record JSON | -)` — record a fresh-operator replay.
 - `transition --ledger DIR --target DIR --candidate C --to STATE (--receipt JSON | -)` — the gate.
 - `pending-complete --ledger DIR --action A (--receipt JSON | -)` — close a pending action.
 - `file-close --ledger DIR --file PATH` — refused while a sweep is open.
 - `summary --ledger DIR` — report-ready one-line refs, open pendings, `report_blocking`.
-- `conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F]` — the
+- `conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F
+  --require-handoff]` — the
   deterministic **closure gate**: machine set-diffs (inventory − covered − omitted; terminal-state
   candidates missing their receipt; dirty-confirmed with no sweep; **a severe (High/Critical
   high-water-mark) finding sitting at effective-Low with no material-downgrade receipt** — catches a
@@ -121,8 +150,8 @@ refused). `file-close --file F` is REFUSED while a `dirty_sweep` for a candidate
   non-empty. This is the "verify claims, not just re-read your own work" pass — coverage, rejection, and
   downgrade claims are checked, not only `confirmed` ones, because those are the claims that *suppress* work.
 
-Self-test: `python3 scripts/test-raptor-loop-ledger` (52 assertions; no network, no RAPTOR imports).
-Eval battery + fixtures: `eval/README.md` (the 11-axis trap suite; deterministic axes are these tests,
+Self-test: `python3 scripts/test-raptor-loop-ledger` (93 assertions; no network, no RAPTOR imports).
+Eval battery + fixtures: `eval/README.md` (the 12-axis trap suite; deterministic axes are these tests,
 live-model axes are orchestrator-driven).
 
 ## Why this is safe / what it is not

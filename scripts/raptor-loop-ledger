@@ -20,14 +20,18 @@ Subcommands (all writers lock + atomic-write + fsync):
   init        --ledger DIR --target DIR
   add         --ledger DIR --target DIR (--record JSON | -)      -> registers a candidate (open)
   cross-vendor --ledger DIR (--job JSON | -)                     -> records a dispatched review job
+  intervention --ledger DIR --target DIR (--record JSON | -)     -> records a workaround/tacit step
+  intervention-resolve --ledger DIR --target DIR --intervention I (--record JSON | -)
+  handoff-review --ledger DIR --target DIR (--record JSON | -)   -> records a fresh-operator replay
   transition  --ledger DIR --target DIR --candidate C --to STATE (--receipt JSON | -)
   pending-complete --ledger DIR --action A (--receipt JSON | -)
   file-close  --ledger DIR --file PATH                           -> refused while a sweep is open
   summary     --ledger DIR                                       -> report-ready one-line refs + open pendings
-  conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F]
+  conformance --ledger DIR [--target D --inventory F --covered F --omitted F --claims F
+                            --require-handoff]
                                                                  -> deterministic closure gate (set-diffs)
 
-Exit codes: 0 ok; 3 transition/close/conformance REFUSED (receipt incomplete, pending open, or diff nonempty); 2 usage/data error.
+Exit codes: 0 ok; 3 a transition, receipt, handoff, close, or conformance gate REFUSED; 2 usage/data error.
 Pure stdlib. No RAPTOR imports, no sys.path manipulation.
 """
 from __future__ import annotations
@@ -42,7 +46,7 @@ import tempfile
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ---- bounds (mirror raptor-loop-kb's fail-closed discipline) ------------------
 MAX_INPUT_BYTES = 1 * 1024 * 1024
@@ -50,6 +54,8 @@ MAX_LEDGER_BYTES = 64 * 1024 * 1024
 MAX_CANDIDATES = 100000
 MAX_PENDING = 100000
 MAX_JOBS = 100000
+MAX_INTERVENTIONS = 100000
+MAX_HANDOFF_REVIEWS = 10000
 MAX_FIELD_CHARS = 500
 MAX_LIST_LEN = 32
 
@@ -72,6 +78,16 @@ LIVE_OUTCOMES = {"vulnerable", "safe", "inconclusive"}
 # of a severe finding to Low (see the material-downgrade gate). A downgrade may cite only concur_downgrade.
 REVIEW_VERDICTS = {"uphold", "overturn", "inconclusive", "concur_downgrade"}
 PENDING_STATES = {"queued", "completed", "blocked"}
+INTERVENTION_CLASSES = {
+    "target-defect", "harness-defect", "documentation-defect",
+    "environment-mismatch", "operator-error", "unresolved",
+}
+INTERVENTION_RESOLUTIONS = {
+    "documented", "eliminated", "matches-claimed-deployment",
+    "documented-lab-boundary", "accepted-blocker",
+}
+CLAIM_SCOPES = {"exact-target", "declared-lab"}
+TARGET_EQUIVALENCE = {"exact-target", "declared-lab", "modified-target", "unknown"}
 # bug classes that make a confirmed finding "proven-dirty" -> auto file sweep
 DIRTY_BUG_CLASSES = {"memory-safety", "memory", "cwe-119", "cwe-120", "cwe-122",
                      "cwe-125", "cwe-787", "cwe-416", "cwe-415", "cwe-190", "cwe-476"}
@@ -252,7 +268,8 @@ def _atomic_write(root: Path, data: dict) -> None:
 
 def _empty_ledger() -> dict:
     return {"schema_version": SCHEMA_VERSION, "target_identity": {}, "candidates": {},
-            "pending_actions": [], "cross_vendor_jobs": {}, "closed_files": [], "updated": ""}
+            "pending_actions": [], "cross_vendor_jobs": {}, "closed_files": [],
+            "interventions": {}, "handoff_reviews": [], "delivery_revision": 0, "updated": ""}
 
 
 def _load(root: Path) -> dict:
@@ -267,13 +284,22 @@ def _load(root: Path) -> dict:
         raise SystemExit(f"ledger: corrupt ledger.json ({e}); refusing")
     if not isinstance(data, dict):
         raise SystemExit("ledger: ledger.json is not an object; refusing")
+    version = data.get("schema_version", 1)
+    if not isinstance(version, int) or version < 1 or version > SCHEMA_VERSION:
+        raise SystemExit(f"ledger: unsupported schema_version {version!r}; refusing")
     for k, v in _empty_ledger().items():
         data.setdefault(k, v)
+    # Schema v2 adds delivery-only intervention and cold-handoff records. They are backward-
+    # compatible optional collections, so a v1 ledger is upgraded on its next atomic write.
+    data["schema_version"] = SCHEMA_VERSION
     # minimal structural typing
     for k, t in (("candidates", dict), ("pending_actions", list),
-                 ("cross_vendor_jobs", dict), ("closed_files", list)):
+                 ("cross_vendor_jobs", dict), ("closed_files", list),
+                 ("interventions", dict), ("handoff_reviews", list)):
         if not isinstance(data[k], t):
             raise SystemExit(f"ledger: field {k!r} wrong type; refusing")
+    if not isinstance(data["delivery_revision"], int) or data["delivery_revision"] < 0:
+        raise SystemExit("ledger: field 'delivery_revision' wrong type/value; refusing")
     return data
 
 
@@ -351,6 +377,180 @@ def _receipt_id(candidate_id: str, to_state: str, receipt: dict) -> str:
 
 def _action_id(target_cid: str, kind: str) -> str:
     return "A-" + _sha((target_cid + "|" + kind).encode())[:10]
+
+
+def _intervention_id(rec: dict) -> str:
+    return "I-" + _sha(json.dumps(rec, sort_keys=True, separators=(",", ":")).encode())[:12]
+
+
+def _handoff_review_id(rec: dict, at: str) -> str:
+    key = at + "|" + json.dumps(rec, sort_keys=True)[:8000]
+    return "H-" + _sha(key.encode())[:12]
+
+
+def _nonempty_list(value) -> bool:
+    return isinstance(value, list) and bool([v for v in value if str(v).strip()])
+
+
+def _cap_list(value) -> list:
+    return [_cap(v) for v in value[:MAX_LIST_LEN] if str(v).strip()]
+
+
+def _validate_intervention_record(rec: dict) -> tuple[bool, list]:
+    errs = []
+    for field in ("stage", "unexpected_condition", "intervention"):
+        if not str(rec.get(field, "")).strip():
+            errs.append(f"{field} required")
+    if rec.get("classification") not in INTERVENTION_CLASSES:
+        errs.append(f"classification must be one of {sorted(INTERVENTION_CLASSES)}")
+    for field in ("documented_before_run", "required_for_success",
+                  "changed_target_semantics", "changed_security_controls",
+                  "operator_knowledge_required"):
+        if not isinstance(rec.get(field), bool):
+            errs.append(f"{field} required (boolean)")
+    if not _nonempty_list(rec.get("evidence")):
+        errs.append("evidence must be a non-empty list of logs, commands, paths, or observations")
+    elif len(rec["evidence"]) > MAX_LIST_LEN:
+        errs.append(f"evidence has {len(rec['evidence'])} entries; cap is {MAX_LIST_LEN}")
+    return (not errs, errs)
+
+
+def _validate_intervention_resolution(rec: dict) -> tuple[bool, list]:
+    errs = []
+    outcome = rec.get("resolution")
+    if outcome not in INTERVENTION_RESOLUTIONS:
+        errs.append(f"resolution must be one of {sorted(INTERVENTION_RESOLUTIONS)}")
+    if not _nonempty_list(rec.get("evidence")):
+        errs.append("evidence must be a non-empty list proving the resolution")
+    elif len(rec["evidence"]) > MAX_LIST_LEN:
+        errs.append(f"evidence has {len(rec['evidence'])} entries; cap is {MAX_LIST_LEN}")
+    required = {
+        "documented": "instructions_artifact",
+        "matches-claimed-deployment": "deployment_evidence",
+        "documented-lab-boundary": "limitations_artifact",
+        "eliminated": "verification_artifact",
+        "accepted-blocker": "blocker",
+    }.get(outcome)
+    if required and not str(rec.get(required, "")).strip():
+        errs.append(f"resolution={outcome} requires {required}")
+    return (not errs, errs)
+
+
+def _validate_marker(name: str, marker) -> list:
+    if not isinstance(marker, dict):
+        return [f"{name} must be an object {{expected, observed, passed}}"]
+    errs = []
+    if not str(marker.get("expected", "")).strip():
+        errs.append(f"{name}.expected required")
+    if not str(marker.get("observed", "")).strip():
+        errs.append(f"{name}.observed required")
+    if not isinstance(marker.get("passed"), bool):
+        errs.append(f"{name}.passed required (boolean)")
+    return errs
+
+
+def _validate_handoff_review(rec: dict) -> tuple[bool, list]:
+    errs = []
+    for field in ("reviewer", "package_digest", "environment_digest", "instructions_artifact"):
+        if not str(rec.get(field, "")).strip():
+            errs.append(f"{field} required")
+    for field in ("reviewer_independent", "author_assistance"):
+        if not isinstance(rec.get(field), bool):
+            errs.append(f"{field} required (boolean)")
+    if rec.get("claim_scope") not in CLAIM_SCOPES:
+        errs.append(f"claim_scope must be one of {sorted(CLAIM_SCOPES)}")
+    if rec.get("target_equivalence") not in TARGET_EQUIVALENCE:
+        errs.append(f"target_equivalence must be one of {sorted(TARGET_EQUIVALENCE)}")
+    errs.extend(_validate_marker("success_marker", rec.get("success_marker")))
+    errs.extend(_validate_marker("negative_control", rec.get("negative_control")))
+    if not _nonempty_list(rec.get("observed_artifacts")):
+        errs.append("observed_artifacts must be a non-empty list")
+    elif len(rec["observed_artifacts"]) > MAX_LIST_LEN:
+        errs.append(f"observed_artifacts has {len(rec['observed_artifacts'])} entries; cap is {MAX_LIST_LEN}")
+    return (not errs, errs)
+
+
+def _delivery_assessment(led: dict) -> dict:
+    """Recompute owner-delivery readiness from the latest cold handoff and ALL interventions.
+
+    This is deliberately separate from candidate state and `report_blocking`: a technically proven
+    finding can remain proven while its package is not yet reproducible by a fresh operator.
+    """
+    reviews = led.get("handoff_reviews", [])
+    if not reviews:
+        return {"delivery_readiness": "blocked", "delivery_blocking": True,
+                "latest_handoff_review": None,
+                "blocking_reasons": ["no fresh-operator handoff review recorded"]}
+
+    review = reviews[-1]
+    reasons = []
+    levels = []
+
+    def block(level: str, reason: str) -> None:
+        levels.append(level)
+        reasons.append(reason)
+
+    review_ok, review_errs = _validate_handoff_review(review)
+    if not review_ok:
+        for err in review_errs:
+            block("blocked", f"latest handoff review fails the current receipt contract: {err}")
+    if review.get("delivery_revision") != led.get("delivery_revision"):
+        block("blocked", "latest handoff review predates a delivery-affecting intervention or resolution")
+
+    if review.get("reviewer_independent") is not True:
+        block("blocked", "handoff reviewer was not independent of PoC construction")
+    if review.get("author_assistance") is not False:
+        block("needs_documentation", "fresh operator required author assistance")
+    if (review.get("success_marker") or {}).get("passed") is not True:
+        block("blocked", "fresh operator did not reproduce the exact success marker")
+    if (review.get("negative_control") or {}).get("passed") is not True:
+        block("blocked", "fresh operator did not pass the causal negative control")
+
+    scope = review.get("claim_scope")
+    equivalence = review.get("target_equivalence")
+    if scope == "exact-target" and equivalence != "exact-target":
+        block("blocked", f"exact-target claim used target_equivalence={equivalence!r}")
+    if scope == "declared-lab" and equivalence not in ("exact-target", "declared-lab"):
+        block("blocked", f"declared-lab claim used target_equivalence={equivalence!r}")
+
+    doc_resolutions = {"documented", "eliminated", "matches-claimed-deployment",
+                       "documented-lab-boundary"}
+    for iid, intervention in sorted(led.get("interventions", {}).items()):
+        intervention_ok, intervention_errs = _validate_intervention_record(intervention)
+        if not intervention_ok:
+            for err in intervention_errs:
+                block("blocked", f"{iid} fails the current intervention contract: {err}")
+        resolution_record = intervention.get("resolution") or {}
+        resolution = resolution_record.get("resolution", "")
+        if resolution_record:
+            resolution_ok, resolution_errs = _validate_intervention_resolution(resolution_record)
+            if not resolution_ok:
+                for err in resolution_errs:
+                    block("blocked", f"{iid} resolution fails the current receipt contract: {err}")
+        classification = intervention.get("classification")
+        if resolution == "accepted-blocker":
+            block("blocked", f"{iid} remains an accepted delivery blocker")
+            continue
+        if intervention.get("required_for_success") and not intervention.get("documented_before_run") \
+                and resolution not in doc_resolutions:
+            if classification in ("documentation-defect", "operator-error"):
+                level = "needs_documentation"
+            elif classification in ("environment-mismatch", "harness-defect"):
+                level = "needs_environment_fix"
+            else:
+                level = "blocked"
+            block(level, f"{iid} is a required, undocumented intervention with no accepted resolution")
+        if intervention.get("changed_target_semantics") or intervention.get("changed_security_controls"):
+            allowed = {"eliminated", "matches-claimed-deployment"}
+            if scope == "declared-lab":
+                allowed.add("documented-lab-boundary")
+            if resolution not in allowed:
+                block("blocked", f"{iid} changed target/security semantics and is not valid for {scope}")
+
+    priority = {"ready": 0, "needs_documentation": 1, "needs_environment_fix": 2, "blocked": 3}
+    readiness = max(levels, key=lambda x: priority[x]) if levels else "ready"
+    return {"delivery_readiness": readiness, "delivery_blocking": readiness != "ready",
+            "latest_handoff_review": review.get("review_id"), "blocking_reasons": reasons}
 
 
 # ============================ receipt validators ===============================
@@ -647,6 +847,153 @@ def cmd_cross_vendor(args) -> int:
         led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
         _atomic_write(root, led)
     print(json.dumps({"job_id": jid, "verdict": verdict}))
+    return 0
+
+
+def cmd_intervention(args) -> int:
+    """Record a workaround or tacit operator intervention without changing candidate state."""
+    root = _ensure_root(args.ledger, args.target)
+    _assert_target_matches(_load(root), args.target)
+    rec = _read_json_arg(args.record, args.file)
+    ok, errs = _validate_intervention_record(rec)
+    if not ok:
+        print(json.dumps({"intervention": "REFUSED", "errors": errs}, indent=2))
+        return 3
+    iid = _intervention_id(rec)
+    with _Lock(root):
+        led = _load(root)
+        if len(led["interventions"]) >= MAX_INTERVENTIONS and iid not in led["interventions"]:
+            raise SystemExit("ledger: intervention cap reached; refusing")
+        existing = led["interventions"].get(iid)
+        if existing is None:
+            led["interventions"][iid] = {
+                "intervention_id": iid,
+                "stage": _cap(rec.get("stage", ""), 128),
+                "unexpected_condition": _cap(rec.get("unexpected_condition", "")),
+                "intervention": _cap(rec.get("intervention", "")),
+                "candidate_id": _cap(rec.get("candidate_id", ""), 32),
+                "classification": rec["classification"],
+                "documented_before_run": rec["documented_before_run"],
+                "required_for_success": rec["required_for_success"],
+                "changed_target_semantics": rec["changed_target_semantics"],
+                "changed_security_controls": rec["changed_security_controls"],
+                "operator_knowledge_required": rec["operator_knowledge_required"],
+                "evidence": _cap_list(rec["evidence"]),
+                "resolution": None,
+                "resolution_history": [],
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
+            }
+            led["delivery_revision"] += 1
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    assessment = _delivery_assessment(led)
+    print(json.dumps({"intervention": "RECORDED", "intervention_id": iid,
+                      "new": existing is None, **assessment}, indent=2))
+    return 0
+
+
+def cmd_intervention_resolve(args) -> int:
+    root = _ensure_root(args.ledger, args.target)
+    _assert_target_matches(_load(root), args.target)
+    rec = _read_json_arg(args.record, args.file)
+    ok, errs = _validate_intervention_resolution(rec)
+    if not ok:
+        print(json.dumps({"intervention_resolution": "REFUSED", "intervention_id": args.intervention,
+                          "errors": errs}, indent=2))
+        return 3
+    with _Lock(root):
+        led = _load(root)
+        intervention = led["interventions"].get(args.intervention)
+        if intervention is None:
+            raise SystemExit(f"ledger intervention-resolve: unknown intervention {args.intervention!r}")
+        certified_commit = _cap(_run_git(Path(args.target), "rev-parse", "HEAD").strip(), 64)
+        if not certified_commit and (led.get("target_identity") or {}).get("commit_bindable"):
+            raise SystemExit("ledger intervention-resolve: target HEAD is unresolvable; refusing an "
+                             "intervention resolution that cannot bind to the reviewed tree")
+        previous = intervention.get("resolution")
+        resolution_history = intervention.setdefault("resolution_history", [])
+        if not isinstance(resolution_history, list):
+            raise SystemExit("ledger intervention-resolve: resolution_history wrong type; refusing")
+        if previous is not None and not resolution_history:
+            # Backward-compatible preservation for an early schema-v2 record written before
+            # resolution history existed.
+            resolution_history.append(previous)
+        if len(resolution_history) >= MAX_LIST_LEN:
+            raise SystemExit(f"ledger intervention-resolve: resolution history cap "
+                             f"({MAX_LIST_LEN}) reached; start a new engagement ledger")
+        resolution_record = {
+            "resolution": rec["resolution"],
+            "evidence": _cap_list(rec["evidence"]),
+            "instructions_artifact": _cap(rec.get("instructions_artifact", ""), 256),
+            "deployment_evidence": _cap(rec.get("deployment_evidence", ""), 256),
+            "limitations_artifact": _cap(rec.get("limitations_artifact", ""), 256),
+            "verification_artifact": _cap(rec.get("verification_artifact", ""), 256),
+            "blocker": _cap(rec.get("blocker", "")),
+            "certified_commit": certified_commit,
+        }
+        if previous is not None and all(previous.get(k) == v for k, v in resolution_record.items()):
+            print(json.dumps({"intervention_resolution": "REFUSED",
+                              "intervention_id": args.intervention,
+                              "errors": ["identical resolution already recorded; receipts are append-only"]},
+                             indent=2))
+            return 3
+        resolution_record["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        resolution_history.append(resolution_record)
+        intervention["resolution"] = resolution_record
+        led["delivery_revision"] += 1
+        led["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        _atomic_write(root, led)
+    print(json.dumps({"intervention_resolution": "ACCEPTED", "intervention_id": args.intervention,
+                      **_delivery_assessment(led)}, indent=2))
+    return 0
+
+
+def cmd_handoff_review(args) -> int:
+    root = _ensure_root(args.ledger, args.target)
+    _assert_target_matches(_load(root), args.target)
+    rec = _read_json_arg(args.record, args.file)
+    ok, errs = _validate_handoff_review(rec)
+    if not ok:
+        print(json.dumps({"handoff_review": "REFUSED", "errors": errs}, indent=2))
+        return 3
+    with _Lock(root):
+        led = _load(root)
+        if len(led["handoff_reviews"]) >= MAX_HANDOFF_REVIEWS:
+            raise SystemExit("ledger: handoff review cap reached; refusing")
+        certified_commit = _cap(_run_git(Path(args.target), "rev-parse", "HEAD").strip(), 64)
+        if not certified_commit and (led.get("target_identity") or {}).get("commit_bindable"):
+            raise SystemExit("ledger handoff-review: target HEAD is unresolvable; refusing a review "
+                             "that cannot bind to the reviewed tree")
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now()))
+        review = {
+            "reviewer": _cap(rec.get("reviewer", ""), 128),
+            "reviewer_independent": rec["reviewer_independent"],
+            "package_digest": _cap(rec.get("package_digest", ""), 128),
+            "environment_digest": _cap(rec.get("environment_digest", ""), 128),
+            "instructions_artifact": _cap(rec.get("instructions_artifact", ""), 256),
+            "author_assistance": rec["author_assistance"],
+            "claim_scope": rec["claim_scope"],
+            "target_equivalence": rec["target_equivalence"],
+            "success_marker": {"expected": _cap(rec["success_marker"].get("expected", "")),
+                               "observed": _cap(rec["success_marker"].get("observed", "")),
+                               "passed": rec["success_marker"]["passed"]},
+            "negative_control": {"expected": _cap(rec["negative_control"].get("expected", "")),
+                                 "observed": _cap(rec["negative_control"].get("observed", "")),
+                                 "passed": rec["negative_control"]["passed"]},
+            "observed_artifacts": _cap_list(rec["observed_artifacts"]),
+            "delivery_revision": led["delivery_revision"],
+            "certified_commit": certified_commit,
+            "at": at,
+        }
+        review["review_id"] = _handoff_review_id(review, at)
+        led["handoff_reviews"].append(review)
+        assessment = _delivery_assessment(led)
+        review["delivery_readiness_at_recording"] = assessment["delivery_readiness"]
+        review["blocking_reasons_at_recording"] = assessment["blocking_reasons"]
+        led["updated"] = at
+        _atomic_write(root, led)
+    print(json.dumps({"handoff_review": "RECORDED", "review_id": review["review_id"],
+                      **_delivery_assessment(led)}, indent=2))
     return 0
 
 
@@ -1093,10 +1440,14 @@ def cmd_summary(args) -> int:
                      "path": c.get("path", ""), "receipts": rec_ids,
                      "one_line": f"{cid} {st}" + (f" [{','.join(rec_ids.values())}]" if rec_ids else "")})
     open_pending = [a for a in led["pending_actions"] if a.get("state") != "completed"]
+    delivery = _delivery_assessment(led)
     payload = {"candidate_count": len(led["candidates"]), "state_counts": counts,
                "open_pending_actions": open_pending, "cross_vendor_jobs": len(led["cross_vendor_jobs"]),
                "closed_files": led["closed_files"], "candidates": refs,
-               "report_blocking": bool(open_pending)}
+               "report_blocking": bool(open_pending),
+               "intervention_count": len(led["interventions"]),
+               "handoff_review_count": len(led["handoff_reviews"]),
+               **delivery}
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -1337,6 +1688,33 @@ def cmd_conformance(args) -> int:
                        "against the ledger; this is the axis that catches a report claiming a "
                        "disposition the state machine never recorded")
 
+    # (6) owner-delivery extension. This is opt-in because it is deliberately orthogonal to the
+    # technical verdict: an evidence-backed finding may be technically final while its PoC package
+    # still needs documentation or environment repair. Owner-facing delivery runs opt in with
+    # --require-handoff; the gate then demands a fresh, uncoached operator replay.
+    delivery = _delivery_assessment(led)
+    if args.require_handoff:
+        if delivery["delivery_readiness"] != "ready":
+            fail("delivery_readiness_not_ready",
+                 [delivery["delivery_readiness"] + ": " + reason
+                  for reason in delivery["blocking_reasons"]])
+        latest = led.get("handoff_reviews", [])[-1] if led.get("handoff_reviews") else None
+        if not args.target:
+            fail("handoff_staleness_unchecked",
+                 ["--require-handoff also requires --target so the cold-handoff receipt can be "
+                  "bound to the current audited commit"])
+        elif latest is not None:
+            cur = _run_git(Path(args.target), "rev-parse", "HEAD").strip()
+            certified = latest.get("certified_commit", "")
+            commit_bindable = bool((led.get("target_identity") or {}).get("commit_bindable"))
+            if commit_bindable and not certified:
+                fail("handoff_receipt_not_commit_bound",
+                     [f"{latest.get('review_id')}: no certified_commit"])
+            elif cur and certified != cur:
+                fail("stale_handoff_receipt_vs_current_commit",
+                     [f"{latest.get('review_id')}: certified@{certified[:10]}!=head@{cur[:10]}"])
+        executed.append("fresh_operator_handoff")
+
     # VERDICT. Three values, derived from facts — never a caller-chosen label, and there is no
     # "PASS with residue". A known contradiction is FAIL even on an interim run; skipped mandatory
     # inputs are PARTIAL (nothing contradicted, but nothing like full assurance either).
@@ -1349,7 +1727,8 @@ def cmd_conformance(args) -> int:
     print(json.dumps({"conformance": verdict,
                       "checks_executed": sorted(set(executed)),
                       "checks_skipped": skipped,
-                      "failures": failures}, indent=2))
+                      "failures": failures,
+                      "delivery": delivery}, indent=2))
     return 0 if verdict == "PASS" else 3
 
 
@@ -1372,6 +1751,19 @@ def main(argv=None) -> int:
     p.add_argument("--job"); p.add_argument("--file")
     p.set_defaults(func=cmd_cross_vendor)
 
+    p = sub.add_parser("intervention"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True); p.add_argument("--record"); p.add_argument("--file")
+    p.set_defaults(func=cmd_intervention)
+
+    p = sub.add_parser("intervention-resolve"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True); p.add_argument("--intervention", required=True)
+    p.add_argument("--record"); p.add_argument("--file")
+    p.set_defaults(func=cmd_intervention_resolve)
+
+    p = sub.add_parser("handoff-review"); p.add_argument("--ledger", required=True)
+    p.add_argument("--target", required=True); p.add_argument("--record"); p.add_argument("--file")
+    p.set_defaults(func=cmd_handoff_review)
+
     p = sub.add_parser("transition"); p.add_argument("--ledger", required=True)
     p.add_argument("--target", required=True); p.add_argument("--candidate", required=True)
     p.add_argument("--to", required=True); p.add_argument("--receipt"); p.add_argument("--file")
@@ -1389,7 +1781,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("conformance"); p.add_argument("--ledger", required=True)
     p.add_argument("--target"); p.add_argument("--inventory"); p.add_argument("--covered")
-    p.add_argument("--omitted"); p.add_argument("--claims")
+    p.add_argument("--omitted"); p.add_argument("--claims"); p.add_argument("--require-handoff", action="store_true")
     p.set_defaults(func=cmd_conformance)
 
     args = ap.parse_args(argv)

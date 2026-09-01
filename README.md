@@ -50,9 +50,12 @@ service") and the skill triggers on its own. Point it at a repo, a service, a mo
 - **Disposition ledger** (`raptor-loop-ledger`) — an engagement-scoped state machine that certifies
   every disposition transition (confirm / reject / downgrade / sweep) against an evidence receipt, so a
   real bug can't be quietly rejected and a severe finding can't be laundered down to Low.
+- **Fresh-operator handoff gate** — records tacit workarounds and their resolutions, then independently
+  replays an immutable PoC/lab package without author coaching. Technical validity and owner-delivery
+  readiness remain separate outcomes.
 - **Execution-auth broker** (`raptor-loop-exec`) — a live-PoC command runs only under a typed,
   least-privilege capability grant.
-- **Eval trap battery** (`eval/`) — 11 deterministic and orchestrator-driven axes (recall,
+- **Eval trap battery** (`eval/`) — 12 deterministic and orchestrator-driven axes (recall,
   FP-resistance, false-rejection, counterfeit-evidence, coverage-honesty, severity-downgrade
   integrity, …).
 
@@ -68,11 +71,12 @@ clever instruction.
 | `references/vuln-class-discovery.md` | Leaf-level per-class search procedure (source → sink → oracle → variants). |
 | `references/kb-schema.md` | Schema + storage for the monotonic-scrutiny cross-run knowledge base. |
 | `references/ledger-schema.md` | Schema + the disposition-time transition gate (candidate ledger + evidence receipts). |
+| `references/handoff-reproducibility.md` | Fresh-operator replay, intervention receipts, and owner-delivery readiness. |
 | `scripts/raptor-loop-kb` | Deterministic cross-run KB helper (can only ever raise hunt scrutiny). |
 | `scripts/raptor-loop-ledger` | Candidate state machine — certifies each disposition against an evidence receipt. |
 | `scripts/raptor-loop-exec` | Execution-auth broker — least-privilege sandbox plan for live PoCs. |
 | `scripts/test-*` | Self-contained tests (no network, no external imports). |
-| `eval/` | The 11-axis trap battery. |
+| `eval/` | The 12-axis trap battery. |
 
 The scripts are pure-stdlib Python and self-contained; the execution broker will optionally use a host
 RAPTOR checkout's sandbox when one is present (`RAPTOR_DIR`), and refuses to run live commands
