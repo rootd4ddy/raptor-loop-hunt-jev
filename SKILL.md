@@ -53,8 +53,7 @@ next actions using ordinary RAPTOR state (current-run ledger, uncovered cells, p
 known evidence gaps), then let Jev make typed scheduling judgments over that supplied set.
 
 The load-bearing authority rule is **planner-only and non-dispositive**. Jev may recommend ordering,
-expected information gain, deterministic-first vs frontier-model work, executor class, and additive
-follow-up routing. It may **never** confirm/correct/reject/duplicate/out-of-scope a finding, downgrade
+expected information gain, deterministic-first work, and independent additive follow-up routing. It may **never** confirm/correct/reject/duplicate/out-of-scope a finding, downgrade
 severity, mark coverage, suppress a candidate/cell/vector/class/pending action, mark code safe, close a
 pending action, or satisfy any ledger receipt. Those remain owned by `raptor-loop-ledger` and the
 existing evidence contract.
@@ -66,16 +65,24 @@ hidden reasoning, or unbounded model output. A Jev conclusion never enters a gen
 prompt as evidence.
 
 Adoption modes are `off|shadow|advisory|reorder` via `RAPTOR_JEV_MODE`; **default is `shadow`**.
-In `reorder`, Jev may reorder only non-mandatory planner work. Mechanically derived obligations
+`reorder` is deliberately **fail-closed until calibrated**: non-mandatory auto-selection requires an
+additional explicit `RAPTOR_JEV_REORDER_ENABLE=1`. Mechanically derived obligations
 (open ledger pending actions, coverage/completeness work, required reviews, dirty sweeps, conformance
 failures, handoff blockers) are marked `mandatory: true` and always take precedence. Missing
 credentials, timeout, API failure, or malformed output is non-blocking: continue baseline RAPTOR.
 
 Before optional fan-out, call `scripts/raptor-loop-jev next-action` on the pre-enumerated action set.
-After a worker/explorer/tool result returns, `route-result` may suggest only additive routes such as
-open/join candidate, run a deterministic check, gather more evidence, or escalate to a frontier
-reasoner. Keep its JSONL receipts under `$OUTPUT_DIR/planner/jev-decisions.jsonl`, separate from the
-candidate ledger. Full contract and examples: `references/jev-planner.md`.
+After a worker/explorer/tool result returns, `route-result` asks **independent Noul questions** for
+compatible additive routes (open/join candidate, attach evidence, deterministic check, more evidence,
+frontier review, duplicate review); never force them through one mutually-exclusive Choice. Keep its
+JSONL receipts under `$OUTPUT_DIR/planner/jev-decisions.jsonl`, separate from the candidate ledger.
+
+In `shadow`, a Jev call is incomplete as evaluation data until the orchestrator records what baseline
+RAPTOR actually chose and what happened using `scripts/raptor-loop-jev observe --decision-id ...`.
+Record at least the baseline/executed action plus any known gate-closure, candidate-opened,
+deterministic-sufficient, and frontier-reasoning-used outcomes. **Do not promote modes from confidence
+numbers alone**; use matched decision/outcome records. Full contract and examples:
+`references/jev-planner.md`.
 
 ## Multi-altitude traversal (the coverage guarantee)
 
@@ -939,10 +946,13 @@ This skill is a methodology; RAPTOR has the orchestration to run it. Wire it up:
 - **Optional Jev planner layer (control plane only).** After mandatory deterministic obligations are
   known and a bounded next-action set has been enumerated, run
   `python3 scripts/raptor-loop-jev next-action --state @planner-state.json --receipt-log "$OUTPUT_DIR/planner/jev-decisions.jsonl"`.
-  After a bounded subagent/tool result returns, `route-result` can recommend the additive next route.
-  Default `RAPTOR_JEV_MODE=shadow`; absence/failure falls back to baseline scheduling. Jev receipts
-  are planner telemetry only and can never satisfy a candidate/coverage/conformance receipt. See
-  `references/jev-planner.md`.
+  After a bounded subagent/tool result returns, `route-result` emits independent additive route
+  probabilities; these are not a mutually-exclusive Choice and are not auto-selected in v2.
+  Default `RAPTOR_JEV_MODE=shadow`; absence/failure falls back to baseline scheduling. In shadow,
+  append an `observe` event keyed by the returned `decision_id` after baseline RAPTOR chooses/executes,
+  otherwise the decision is not calibratable. Active non-mandatory reorder additionally requires
+  `RAPTOR_JEV_REORDER_ENABLE=1`. Jev receipts are planner telemetry only and can never satisfy a
+  candidate/coverage/conformance receipt. See `references/jev-planner.md`.
 
 - **Front-load the deterministic layer** (Round 0, see "Deterministic front-load" above): `/sca`
   for known-CVE deps (log them, then exclude those packages from LLM scope) and `/threat-model
