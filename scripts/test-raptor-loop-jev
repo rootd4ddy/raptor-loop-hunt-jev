@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Self-contained tests for raptor-loop-jev. No external network."""
+import http.server
+import json
+import os
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+EXE = os.path.join(HERE, "raptor-loop-jev")
+passed = failed = 0
+
+def check(name, cond, extra=""):
+    global passed, failed
+    if cond:
+        passed += 1
+        print(f"  ok   {name}")
+    else:
+        failed += 1
+        print(f"  FAIL {name}  {extra}")
+
+def run(kind, state, *extra, env=None):
+    e = dict(os.environ)
+    e.pop("TYPESAFE_API_KEY", None)
+    e.pop("RAPTOR_JEV_MODE", None)
+    if env:
+        e.update(env)
+    p = subprocess.run(
+        [sys.executable, EXE, kind, "--state", json.dumps(state), *extra],
+        capture_output=True, text=True, env=e,
+    )
+    try:
+        out = json.loads(p.stdout)
+    except Exception:
+        out = {}
+    return p.returncode, out, p.stdout + p.stderr
+
+def base_state():
+    return {
+        "run_id": "r1",
+        "goal": "close the current evidence gate",
+        "round": 7,
+        "coverage": {"covered": 8, "total": 10, "raw_source": "DROP-NESTED"},
+        "pending_actions": [{"id":"P1","kind":"dirty_sweep","summary":"sweep one file","raw_source":"DROP-PENDING"}],
+        "recent_tried": ["old path"],
+        "actions": [
+            {"id": "A1", "summary": "Run a deterministic diff", "kind": "deterministic",
+             "deterministic_eligible": True, "queue_rank": 2},
+            {"id": "A2", "summary": "Have an explorer inspect a new call path", "kind": "explorer",
+             "deterministic_eligible": False, "queue_rank": 3},
+        ],
+        "raw_source": "MUST-NOT-LEAVE-THE-HARNESS",
+        "credentials": "MUST-NOT-LEAVE-THE-HARNESS",
+    }
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    seen_auth = None
+    calls = 0
+    force_first_500 = False
+    choice = "A2"
+    retry_counts = []
+    def log_message(self, fmt, *args):
+        pass
+    def do_POST(self):
+        type(self).calls += 1
+        type(self).seen_auth = self.headers.get("Authorization")
+        type(self).retry_counts.append(self.headers.get("X-TypeSafe-Retry-Count"))
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length))
+        if type(self).force_first_500 and type(self).calls == 1:
+            self.send_response(500); self.end_headers(); self.wfile.write(b"temporary")
+            return
+        answers = {}
+        for name, q in body["questions"].items():
+            if q["type"] == "choice":
+                if name == "next_action":
+                    choice = type(self).choice
+                elif name == "route":
+                    choice = "run_deterministic_check"
+                else:
+                    choice = next(iter(q["criteria"]))
+                probs = {k: (0.9 if k == choice else 0.1 / max(1, len(q["criteria"])-1))
+                         for k in q["criteria"]}
+                answers[name] = {"type": "choice", "choice": choice,
+                                 "confidence": 0.9, "probabilities": probs}
+            elif q["type"] == "score":
+                n = len(q["criteria"])
+                answers[name] = {"type":"score","score":3.0,"confidence":0.8,
+                                 "legend":{str(i):v for i,v in enumerate(q["criteria"])},
+                                 "probabilities":{str(i):(1.0 if i==min(3,n-1) else 0.0) for i in range(n)}}
+            else:
+                answers[name] = {"type":"noul","noul":0.7}
+        data = json.dumps({"model":"jev-test","answers":answers,
+                           "usage":{"input_tokens":123,"output_tokens":45}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length",str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+def main():
+    st = base_state()
+
+    rc, out, _ = run("next-action", st, "--dry-run")
+    check("dry-run succeeds without API key", rc == 0 and out.get("dry_run") is True)
+    projected = out.get("projected_state", {})
+    check("state projection drops raw source and credentials",
+          "raw_source" not in projected and "credentials" not in projected)
+    check("nested planner projection drops unknown/raw fields",
+          "raw_source" not in projected.get("coverage", {})
+          and "raw_source" not in projected.get("pending_actions", [{}])[0])
+    q = out.get("request", {}).get("questions", {})
+    check("next-action emits bounded typed questions",
+          q.get("next_action", {}).get("type") == "choice"
+          and q.get("gain__A1", {}).get("type") == "score"
+          and q.get("frontier_needed__A1", {}).get("type") == "noul"
+          and q.get("executor__A1", {}).get("type") == "choice")
+
+    rc, out, text = run("next-action", st)
+    check("missing key is non-blocking unavailable (exit 4)",
+          rc == 4 and out.get("baseline_behavior") == "continue RAPTOR without Jev")
+    check("missing-key output never invents a key", "Bearer" not in text)
+
+    rc, out, _ = run("next-action", st, "--mode", "off", env={"TYPESAFE_API_KEY":"sekrit"})
+    check("off mode makes no decision", rc == 4 and out.get("available") is False)
+
+    bad = base_state()
+    bad["actions"][1]["id"] = "A1"
+    rc, out, _ = run("next-action", bad, "--dry-run")
+    check("duplicate action ids refused", rc == 2 and "unique" in out.get("error",""))
+
+    route_state = {
+        "goal":"triage result",
+        "action":{"id":"A1","summary":"Inspect one path"},
+        "result":{"summary":"Found a concrete mismatch", "claims":["x"], "evidence_labels":["static-diff"], "raw_source":"DROP", "evidence":{"source":"DROP-EVIDENCE"}},
+        "ledger_context":{"candidate_id":"C-1","candidate_state":"open","raw_source":"DROP-LEDGER"},
+    }
+    rc, out, _ = run("route-result", route_state, "--dry-run")
+    route_projected = out.get("projected_state", {})
+    check("route projection drops nested raw evidence/context",
+          "raw_source" not in route_projected.get("result", {})
+          and "evidence" not in route_projected.get("result", {})
+          and "raw_source" not in route_projected.get("ledger_context", {}))
+    criteria = out["request"]["questions"]["route"]["criteria"]
+    forbidden = {"confirm","confirmed","reject","rejected","downgrade","covered","safe","suppress"}
+    check("route vocabulary has no terminal disposition",
+          not any(word in " ".join(criteria.keys()).lower().split() for word in forbidden))
+
+    with socketserver.TCPServer(("127.0.0.1", 0), Handler) as srv:
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        with tempfile.TemporaryDirectory() as td:
+            log = str(Path(td)/"planner"/"jev-decisions.jsonl")
+            Handler.calls = 0
+            Handler.seen_auth = None
+            Handler.choice = "A2"
+            rc, out, text = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "advisory", "--receipt-log", log,
+                env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            check("live local API call succeeds", rc == 0 and out.get("ok") is True, text)
+            check("Bearer auth sent", Handler.seen_auth == "Bearer test-key")
+            rec = out.get("receipt", {})
+            check("advisory returns recommendation but no policy-selected action",
+                  rec.get("decision",{}).get("recommended_action") == "A2"
+                  and rec.get("decision",{}).get("policy_selected_action") is None)
+            check("receipt log written", Path(log).exists() and Path(log).read_text().strip())
+            check("API key never appears in receipt/output",
+                  "test-key" not in json.dumps(rec) and "test-key" not in text)
+
+            mandatory = base_state()
+            mandatory["actions"][0]["mandatory"] = True
+            Handler.choice = "A2"
+            rc, out, _ = run(
+                "next-action", mandatory, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "reorder", env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("mandatory work overrides Jev reorder",
+                  rc == 0 and d.get("recommended_action") == "A2"
+                  and d.get("policy_selected_action") == "A1"
+                  and d.get("policy_override") == "mandatory-work-precedence")
+
+            Handler.calls = 0
+            Handler.retry_counts = []
+            Handler.force_first_500 = True
+            Handler.choice = "A1"
+            rc, out, _ = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "shadow", env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            check("transient 500 is retried", rc == 0 and Handler.calls >= 2)
+            check("retry is marked with X-TypeSafe-Retry-Count",
+                  Handler.retry_counts[:2] == [None, "1"], Handler.retry_counts)
+            Handler.force_first_500 = False
+
+            rc, out, _ = run(
+                "route-result", route_state, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "advisory", env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("route-result is planner-only",
+                  rc == 0
+                  and out["receipt"]["authority"] == "planner-only-non-dispositive"
+                  and d.get("policy_selected_route") is None)
+        srv.shutdown()
+
+    print(f"\n{passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
