@@ -73,6 +73,7 @@ _COVERAGE_ALLOW = {"covered", "total", "omitted", "uncovered", "uncovered_count"
 _PENDING_ALLOW = {"id", "kind", "status", "summary", "candidate_id", "sink", "coverage_cell", "mandatory"}
 _LEDGER_CONTEXT_ALLOW = {"candidate_id", "candidate_state", "potential_hwm", "effective_severity", "pending_action_ids", "open_pending_count", "report_blocking", "coverage_cell"}
 _ROUTE_ALLOW = {"action", "result", "ledger_context", "goal", "run_id", "target_label"}
+_OBSERVATION_ALLOW = {"baseline_selected_action", "executed_action", "executed_routes", "result_class", "gate_closed", "candidate_opened", "deterministic_sufficient", "frontier_reasoning_used", "tool_or_agent_ids", "notes"}
 
 GAIN_LEVELS = [
     "Likely adds no meaningful net-new evidence or substantially repeats existing work.",
@@ -92,7 +93,9 @@ ROUTE_SIGNALS = {
 
 
 class JevUnavailable(RuntimeError):
-    pass
+    def __init__(self, message, transport=None):
+        super().__init__(message)
+        self.transport = transport or {}
 
 
 class JevBadInput(ValueError):
@@ -317,8 +320,12 @@ def _load_json_arg(arg: str):
 def _api_post(base_url: str, api_key: str, payload: dict, timeout: float, retries: int = MAX_RETRIES):
     endpoint = base_url.rstrip("/") + "/v1/systemone"
     body = _canonical(payload)
+    started = time.monotonic()
+    attempts = 0
     last = None
+    last_status = None
     for attempt in range(retries + 1):
+        attempts = attempt + 1
         req = urllib.request.Request(
             endpoint,
             data=body,
@@ -334,14 +341,31 @@ def _api_post(base_url: str, api_key: str, payload: dict, timeout: float, retrie
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
+                status = int(getattr(resp, "status", 200))
+                headers = resp.headers
             obj = json.loads(raw)
             if not isinstance(obj, dict) or not isinstance(obj.get("answers"), dict):
                 raise JevUnavailable("TypeSafe response missing answers object")
-            return obj
+            request_id = (
+                headers.get("x-request-id") or headers.get("request-id")
+                or headers.get("x-typesafe-request-id")
+            )
+            return obj, {
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "attempts": attempts,
+                "retries": max(0, attempts - 1),
+                "http_status": status,
+                "request_id": request_id,
+            }
         except urllib.error.HTTPError as e:
+            last_status = e.code
             last = f"TypeSafe HTTP {e.code}"
             if e.code not in RETRY_STATUSES or attempt >= retries:
-                raise JevUnavailable(last) from None
+                raise JevUnavailable(last, {
+                    "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                    "attempts": attempts, "retries": max(0, attempts - 1),
+                    "http_status": last_status,
+                }) from None
             retry_after = e.headers.get("Retry-After")
             try:
                 delay = min(5.0, max(0.0, float(retry_after))) if retry_after else min(0.5 * (2 ** attempt), 2.0)
@@ -351,9 +375,16 @@ def _api_post(base_url: str, api_key: str, payload: dict, timeout: float, retrie
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
             last = f"TypeSafe request failed ({type(e).__name__})"
             if attempt >= retries:
-                raise JevUnavailable(last) from None
+                raise JevUnavailable(last, {
+                    "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                    "attempts": attempts, "retries": max(0, attempts - 1),
+                    "http_status": last_status,
+                }) from None
             time.sleep(min(0.5 * (2 ** attempt), 2.0))
-    raise JevUnavailable(last or "TypeSafe request failed")
+    raise JevUnavailable(last or "TypeSafe request failed", {
+        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "attempts": attempts, "retries": max(0, attempts - 1), "http_status": last_status,
+    })
 
 
 def _answer_choice(answers: dict, name: str):
@@ -436,18 +467,50 @@ def _collect_route(response: dict, mode: str) -> dict:
     }
 
 
-def _receipt(kind: str, state: dict, payload: dict, response: dict, mode: str, decision: dict):
+def _decision_context(kind: str, state: dict) -> dict:
+    if kind == "next-action":
+        return {
+            "run_id": state.get("run_id"),
+            "goal": state.get("goal"),
+            "round": state.get("round"),
+            "altitude": state.get("altitude"),
+            "bug_class": state.get("bug_class"),
+            "actions": state.get("actions", []),
+            "coverage": state.get("coverage", {}),
+            "pending_actions": state.get("pending_actions", []),
+            "recent_tried": state.get("recent_tried", []),
+        }
+    return {
+        "run_id": state.get("run_id"),
+        "goal": state.get("goal"),
+        "action": state.get("action", {}),
+        "result": state.get("result", {}),
+        "ledger_context": state.get("ledger_context", {}),
+    }
+
+
+def _receipt(kind: str, state: dict, payload: dict, response: dict, mode: str, decision: dict, transport: dict):
+    created_at = int(time.time())
+    state_digest = _sha(state)
+    request_digest = _sha(payload)
+    decision_id = "J-" + hashlib.sha256(
+        f"{kind}|{state_digest}|{request_digest}|{created_at}|{time.time_ns()}".encode()
+    ).hexdigest()[:20]
     return {
         "schema_version": SCHEMA_VERSION,
         "methodology_version": METHODOLOGY_VERSION,
+        "event": "decision",
+        "decision_id": decision_id,
         "decision_kind": kind,
         "mode": mode,
         "authority": "planner-only-non-dispositive",
-        "state_digest": _sha(state),
-        "request_digest": _sha(payload),
+        "state_digest": state_digest,
+        "request_digest": request_digest,
+        "decision_context": _decision_context(kind, state),
         "model_requested": payload["model"],
         "model_used": response.get("model"),
         "usage": response.get("usage", {}),
+        "transport": transport,
         "decision": decision,
         "guards": [
             "Jev cannot confirm/reject/downgrade/cover/suppress/mark-safe",
@@ -455,6 +518,45 @@ def _receipt(kind: str, state: dict, payload: dict, response: dict, mode: str, d
             "raw source, secrets, credentials, PoC bytes, and arbitrary tool transcripts are excluded from Jev state",
             "generator/judge/verifier raw-source isolation remains unchanged",
         ],
+        "created_at": created_at,
+    }
+
+
+def _failure_receipt(kind: str, state: dict, payload: dict, mode: str, reason: str, transport: dict):
+    created_at = int(time.time())
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "methodology_version": METHODOLOGY_VERSION,
+        "event": "decision_failure",
+        "decision_id": "JF-" + hashlib.sha256(
+            f"{kind}|{_sha(state)}|{created_at}|{time.time_ns()}".encode()
+        ).hexdigest()[:20],
+        "decision_kind": kind,
+        "mode": mode,
+        "authority": "planner-only-non-dispositive",
+        "state_digest": _sha(state),
+        "request_digest": _sha(payload),
+        "decision_context": _decision_context(kind, state),
+        "model_requested": payload["model"],
+        "transport": transport,
+        "reason": _cap(reason, 500),
+        "baseline_behavior": "continue RAPTOR without Jev",
+        "created_at": created_at,
+    }
+
+
+def _observation(decision_id: str, raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise JevBadInput("observation record must be a JSON object")
+    obs = {k: _cap(raw[k]) for k in _OBSERVATION_ALLOW if k in raw}
+    if not obs:
+        raise JevBadInput("observation record contains no supported fields")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "methodology_version": METHODOLOGY_VERSION,
+        "event": "outcome_observation",
+        "decision_id": decision_id,
+        "observation": obs,
         "created_at": int(time.time()),
     }
 
@@ -498,8 +600,10 @@ def _build(kind: str, raw_state: dict, model: str):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="raptor-loop-jev", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=["next-action", "route-result"])
-    ap.add_argument("--state", required=True, help="JSON object, @file, or - for stdin")
+    ap.add_argument("kind", choices=["next-action", "route-result", "observe"])
+    ap.add_argument("--state", help="JSON object, @file, or - for stdin")
+    ap.add_argument("--decision-id", help="decision id to correlate an outcome observation")
+    ap.add_argument("--record", help="observation JSON object, @file, or - for stdin")
     ap.add_argument("--model", default=os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL))
     ap.add_argument("--base-url", default=os.environ.get("TYPESAFE_BASE_URL", DEFAULT_BASE_URL))
     ap.add_argument("--timeout", type=float, default=float(os.environ.get("RAPTOR_JEV_TIMEOUT", DEFAULT_TIMEOUT)))
@@ -507,6 +611,23 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print projected state + API request, no network")
     ap.add_argument("--receipt-log", help="optional JSONL planner decision log")
     args = ap.parse_args(argv)
+
+    if args.kind == "observe":
+        if not args.receipt_log or not args.decision_id or not args.record:
+            print(json.dumps({"ok": False, "error": "observe requires --receipt-log, --decision-id, and --record"}, indent=2))
+            return 2
+        try:
+            rec = _observation(args.decision_id, _load_json_arg(args.record))
+            _append_receipt(args.receipt_log, rec)
+            print(json.dumps({"ok": True, "observation": rec}, indent=2))
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError, JevBadInput) as e:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            return 2
+
+    if not args.state:
+        print(json.dumps({"ok": False, "error": f"{args.kind} requires --state"}, indent=2))
+        return 2
 
     try:
         mode = _mode(args.mode)
@@ -539,19 +660,23 @@ def main(argv=None) -> int:
         return 4
 
     try:
-        response = _api_post(args.base_url, api_key, payload, args.timeout)
+        response, transport = _api_post(args.base_url, api_key, payload, args.timeout)
         if args.kind == "next-action":
             decision = _collect_next_action(response, state, mode)
         else:
             decision = _collect_route(response, mode)
-        rec = _receipt(args.kind, state, payload, response, mode, decision)
+        rec = _receipt(args.kind, state, payload, response, mode, decision, transport)
         _append_receipt(args.receipt_log, rec)
         print(json.dumps({"ok": True, "receipt": rec}, indent=2))
         return 0
     except (JevUnavailable, OSError, ValueError) as e:
+        transport = getattr(e, "transport", {}) if isinstance(e, JevUnavailable) else {}
+        failure = _failure_receipt(args.kind, state, payload, mode, str(e), transport)
+        _append_receipt(args.receipt_log, failure)
         print(json.dumps({
             "ok": False, "available": False, "reason": str(e),
-            "decision_kind": args.kind, "baseline_behavior": "continue RAPTOR without Jev",
+            "decision_kind": args.kind, "transport": transport,
+            "baseline_behavior": "continue RAPTOR without Jev",
         }, indent=2))
         return 4
 
