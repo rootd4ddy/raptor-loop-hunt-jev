@@ -53,7 +53,7 @@ MAX_ACTIONS = 16
 MAX_TEXT = 2400
 MAX_LIST = 32
 MAX_RETRIES = 2
-RETRY_STATUSES = {408, 429, 500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511, 529}
+RETRY_STATUSES = {408, 429} | set(range(500, 600))
 _ACTION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _MODES = {"off", "shadow", "advisory", "reorder"}
 
@@ -335,6 +335,7 @@ def _api_post(base_url: str, api_key: str, payload: dict, timeout: float, retrie
                 "Accept": "application/json",
                 "Content-Type": "application/json",
                 "User-Agent": f"raptor-loop-hunt/{METHODOLOGY_VERSION}",
+                **({"X-TypeSafe-Retry-Count": str(attempt)} if attempt else {}),
             },
         )
         try:
