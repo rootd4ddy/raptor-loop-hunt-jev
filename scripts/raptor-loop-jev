@@ -17,15 +17,14 @@ Modes (RAPTOR_JEV_MODE or --mode):
   off       no network call; baseline RAPTOR behavior
   shadow    record Jev's decision but do not let it change scheduling (default)
   advisory  expose a recommendation for the orchestrator to consider
-  reorder   allow Jev to reorder only NON-MANDATORY planner work; mandatory ledger /
-            coverage work always wins and Jev still cannot disposition candidates
+  reorder   reserved for calibrated active routing. By default this records the request but does not\n            auto-select non-mandatory work; set RAPTOR_JEV_REORDER_ENABLE=1 only after shadow/advisory evaluation.
 
 Environment:
   TYPESAFE_API_KEY       required for live calls
   TYPESAFE_BASE_URL      default https://api.typesafe.ai
   TYPESAFE_DEFAULT_MODEL default jev-latest
   RAPTOR_JEV_MODE        off|shadow|advisory|reorder (default shadow)
-  RAPTOR_JEV_TIMEOUT     per-attempt seconds (default 10)
+  RAPTOR_JEV_TIMEOUT     per-attempt seconds (default 10)\n  RAPTOR_JEV_REORDER_ENABLE explicit active-routing opt-in after calibration
 
 Pure stdlib. No TypeSafe SDK dependency.
 """
@@ -48,6 +47,7 @@ DEFAULT_BASE_URL = "https://api.typesafe.ai"
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_MODE = "shadow"
+REORDER_ENV = "RAPTOR_JEV_REORDER_ENABLE"
 MAX_STATE_BYTES = 64 * 1024
 MAX_ACTIONS = 16
 MAX_TEXT = 2400
@@ -256,7 +256,7 @@ def _next_action_questions(state: dict) -> dict:
                 "net-new evidence and close the most important current gap, while avoiding repetition? "
                 "This is scheduling only. Do not treat any option as a security disposition."
             ),
-            "criteria": {a["id"]: _action_label(a) for a in actions},
+            "criteria": {**{a["id"]: _action_label(a) for a in actions}, "none_of_these": "None of the supplied actions should run next; the planner should gather missing state or construct a better bounded action set."},
         }
     }
     for a in actions:
@@ -422,15 +422,20 @@ def _collect_next_action(response: dict, state: dict, mode: str) -> dict:
     policy_selected = None
     override = None
     if mode == "reorder":
+        reorder_enabled = os.environ.get(REORDER_ENV, "").strip().lower() in {"1", "true", "yes"}
         if mandatory:
             policy_selected = mandatory[0]["id"]
             if recommended and recommended != policy_selected:
                 override = "mandatory-work-precedence"
-        else:
+        elif reorder_enabled:
             policy_selected = recommended
+        else:
+            policy_selected = None
+            override = "reorder-disabled-until-calibrated"
 
     return {
         "recommended_action": recommended,
+        "raw_choice": choice.get("choice"),
         "recommendation": choice,
         "per_action": per_action,
         "policy_selected_action": policy_selected,
@@ -653,6 +658,10 @@ def main(argv=None) -> int:
 
     api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
     if not api_key:
+        failure = _failure_receipt(
+            args.kind, state, payload, mode, "TYPESAFE_API_KEY is not set", {}
+        )
+        _append_receipt(args.receipt_log, failure)
         print(json.dumps({
             "ok": False, "available": False, "reason": "TYPESAFE_API_KEY is not set",
             "decision_kind": args.kind, "baseline_behavior": "continue RAPTOR without Jev",
