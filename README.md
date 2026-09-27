@@ -1,7 +1,7 @@
-# raptor-loop-hunt
+# raptor-loop-hunt + Jev
 
 An autonomous, looping, multi-altitude **security vulnerability hunt** for a codebase, packaged as a
-Claude Code **skill**. It replaces the model's default "single pass, summarize, stop" behaviour with an
+Claude Code **skill**, with an optional TypeSafe Jev planner/control plane. It replaces the model's default "single pass, summarize, stop" behaviour with an
 explicit search procedure: traverse every altitude, generate candidates, adversarially verify them
 *from raw source*, run isolated parallel reasoners, and keep a persistent ledger so each loop is
 net-new coverage instead of rediscovery. In practice it finds far more real bugs than a one-shot scan —
@@ -15,7 +15,7 @@ It triggers whenever you point Claude at source code and want vulnerabilities fo
 **As a plugin — no clone needed.** Add the marketplace and install; Claude Code fetches it for you:
 
 ```
-/plugin marketplace add dinosn/raptor-loop-hunt
+/plugin marketplace add rootd4ddy/raptor-loop-hunt-jev
 /plugin install raptor-loop-hunt@raptor
 ```
 
@@ -25,7 +25,7 @@ Then `/reload-plugins` (or restart). The skill auto-triggers on audit requests, 
 discovered automatically on the next session:
 
 ```bash
-git clone https://github.com/dinosn/raptor-loop-hunt ~/.claude/skills/raptor-loop-hunt
+git clone https://github.com/rootd4ddy/raptor-loop-hunt-jev ~/.claude/skills/raptor-loop-hunt
 ```
 
 ## Use
@@ -39,12 +39,32 @@ Invoke it explicitly:
 …or just describe an audit task ("audit ./src for security", "find every exploitable bug in this
 service") and the skill triggers on its own. Point it at a repo, a service, a module, or a directory.
 
+### Optional Jev planner
+
+Jev is integrated **inside the RAPTOR loop as a scheduler/router**, not as a security verdict engine.
+The default is shadow mode: RAPTOR sends a bounded planner projection to Jev, logs the typed decisions,
+but does not let them change scheduling yet.
+
+```bash
+export TYPESAFE_API_KEY="..."
+export RAPTOR_JEV_MODE=shadow   # off | shadow | advisory | reorder
+```
+
+The helper uses TypeSafe's System One HTTP API directly, so the repository stays pure-stdlib Python;
+no TypeSafe SDK install is required. In `reorder`, Jev may reorder only non-mandatory planner work.
+The candidate ledger, coverage obligations, generate→judge→verify chain, and all evidence receipts
+remain authoritative. If TypeSafe is unavailable or not configured, RAPTOR continues normally.
+
+See `references/jev-planner.md` for the authority boundary, data-minimization contract, request
+shapes, adoption modes, and calibration workflow.
+
 ## What it does
 
 - **Multi-altitude generate → judge → verify loop.** Candidates are generated at every altitude
   (whole-system down to a single function), then *adversarially* judged and verified from raw source —
   never from the generator's own summary.
 - **Isolated parallel reasoners** so independent findings don't contaminate one another.
+- **Optional Jev planner/control plane** that ranks pre-enumerated next actions, recommends deterministic-first vs frontier-model work and executor roles, and routes completed results—without authority to confirm/reject/downgrade/cover/suppress anything.
 - **Monotonic-scrutiny knowledge base** (`raptor-loop-kb`) that can only ever *raise* scrutiny across
   runs, never lower it — each loop is net-new coverage rather than rediscovery.
 - **Disposition ledger** (`raptor-loop-ledger`) — an engagement-scoped state machine that certifies
@@ -72,10 +92,12 @@ clever instruction.
 | `references/kb-schema.md` | Schema + storage for the monotonic-scrutiny cross-run knowledge base. |
 | `references/ledger-schema.md` | Schema + the disposition-time transition gate (candidate ledger + evidence receipts). |
 | `references/handoff-reproducibility.md` | Fresh-operator replay, intervention receipts, and owner-delivery readiness. |
+| `references/jev-planner.md` | Jev planner authority boundary, state projection, modes, and typed routing decisions. |
 | `scripts/raptor-loop-kb` | Deterministic cross-run KB helper (can only ever raise hunt scrutiny). |
 | `scripts/raptor-loop-ledger` | Candidate state machine — certifies each disposition against an evidence receipt. |
 | `scripts/raptor-loop-exec` | Execution-auth broker — least-privilege sandbox plan for live PoCs. |
-| `scripts/test-*` | Self-contained tests (no network, no external imports). |
+| `scripts/raptor-loop-jev` | Pure-stdlib TypeSafe System One adapter for planner-only `next-action` and `route-result` decisions. |
+| `scripts/test-*` | Self-contained tests (no external network or third-party imports), including the Jev planner fake-endpoint suite. |
 | `eval/` | The 12-axis trap battery. |
 
 The scripts are pure-stdlib Python and self-contained; the execution broker will optionally use a host
