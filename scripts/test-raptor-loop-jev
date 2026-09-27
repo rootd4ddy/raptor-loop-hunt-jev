@@ -121,6 +121,7 @@ def main():
           and q.get("gain__A1", {}).get("type") == "score"
           and q.get("duplicate_risk__A1", {}).get("type") == "noul"
           and q.get("deterministic_first__A1", {}).get("type") == "noul"
+          and "none_of_these" in q.get("next_action", {}).get("criteria", {})
           and "frontier_needed__A1" not in q
           and "executor__A1" not in q)
 
@@ -199,6 +200,26 @@ def main():
                   rc == 0 and d.get("recommended_action") == "A2"
                   and d.get("policy_selected_action") == "A1"
                   and d.get("policy_override") == "mandatory-work-precedence")
+
+            Handler.choice = "A2"
+            rc, out, _ = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "reorder", env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("active reorder is fail-closed until explicitly enabled",
+                  rc == 0 and d.get("recommended_action") == "A2"
+                  and d.get("policy_selected_action") is None
+                  and d.get("policy_override") == "reorder-disabled-until-calibrated")
+
+            rc, out, _ = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "reorder",
+                env={"TYPESAFE_API_KEY":"test-key", "RAPTOR_JEV_REORDER_ENABLE":"1"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("explicit calibrated reorder opt-in can select non-mandatory work",
+                  rc == 0 and d.get("policy_selected_action") == "A2")
 
             Handler.calls = 0
             Handler.retry_counts = []
