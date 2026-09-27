@@ -66,9 +66,12 @@ _ACTION_ALLOW = {
     "deterministic_eligible", "coverage_cell", "pending_action",
 }
 _RESULT_ALLOW = {
-    "summary", "claims", "evidence", "tool_status", "produced_candidate_id",
+    "summary", "claims", "evidence_labels", "tool_status", "produced_candidate_id",
     "changed_files", "open_questions",
 }
+_COVERAGE_ALLOW = {"covered", "total", "omitted", "uncovered", "uncovered_count", "component_count", "cells_remaining"}
+_PENDING_ALLOW = {"id", "kind", "status", "summary", "candidate_id", "sink", "coverage_cell", "mandatory"}
+_LEDGER_CONTEXT_ALLOW = {"candidate_id", "candidate_state", "potential_hwm", "effective_severity", "pending_action_ids", "open_pending_count", "report_blocking", "coverage_cell"}
 _ROUTE_ALLOW = {"action", "result", "ledger_context", "goal", "run_id", "target_label"}
 
 GAIN_LEVELS = [
@@ -130,8 +133,39 @@ def _cap(value, n: int = MAX_TEXT):
     return _cap(str(value), n)
 
 
+def _project_named_object(value, allowed: set[str]) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {k: _cap(value[k]) for k in allowed if k in value}
+
+
+def _project_pending(value) -> list:
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value[:MAX_LIST]:
+        if isinstance(item, dict):
+            out.append(_project_named_object(item, _PENDING_ALLOW))
+        elif isinstance(item, str):
+            out.append(_cap(item, 256))
+    return out
+
+
 def _project_top_level(state: dict) -> dict:
-    return {k: _cap(state[k]) for k in _TOP_LEVEL_ALLOW if k in state}
+    out = {}
+    for k in _TOP_LEVEL_ALLOW:
+        if k not in state:
+            continue
+        if k == "coverage":
+            out[k] = _project_named_object(state[k], _COVERAGE_ALLOW)
+        elif k == "pending_actions":
+            out[k] = _project_pending(state[k])
+        elif k in {"recent_tried", "constraints"}:
+            value = state[k]
+            out[k] = [_cap(x, 512) for x in value[:MAX_LIST]] if isinstance(value, list) else []
+        else:
+            out[k] = _cap(state[k])
+    return out
 
 
 def _project_action(action: dict) -> dict:
@@ -188,6 +222,8 @@ def _project_route_state(raw: dict) -> dict:
             if not isinstance(raw[k], dict):
                 raise JevBadInput("state.result must be an object")
             out[k] = {rk: _cap(raw[k][rk]) for rk in _RESULT_ALLOW if rk in raw[k]}
+        elif k == "ledger_context":
+            out[k] = _project_named_object(raw[k], _LEDGER_CONTEXT_ALLOW)
         else:
             out[k] = _cap(raw[k])
     if "action" not in out or "result" not in out:
