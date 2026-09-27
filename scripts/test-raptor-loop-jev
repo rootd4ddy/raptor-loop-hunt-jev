@@ -61,11 +61,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     calls = 0
     force_first_500 = False
     choice = "A2"
+    retry_counts = []
     def log_message(self, fmt, *args):
         pass
     def do_POST(self):
         type(self).calls += 1
         type(self).seen_auth = self.headers.get("Authorization")
+        type(self).retry_counts.append(self.headers.get("X-TypeSafe-Retry-Count"))
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length))
         if type(self).force_first_500 and type(self).calls == 1:
@@ -176,6 +178,7 @@ def main():
                   and d.get("policy_override") == "mandatory-work-precedence")
 
             Handler.calls = 0
+            Handler.retry_counts = []
             Handler.force_first_500 = True
             Handler.choice = "A1"
             rc, out, _ = run(
@@ -183,6 +186,8 @@ def main():
                 "--mode", "shadow", env={"TYPESAFE_API_KEY":"test-key"}
             )
             check("transient 500 is retried", rc == 0 and Handler.calls >= 2)
+            check("retry is marked with X-TypeSafe-Retry-Count",
+                  Handler.retry_counts[:2] == [None, "1"], Handler.retry_counts)
             Handler.force_first_500 = False
 
             rc, out, _ = run(
