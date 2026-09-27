@@ -23,16 +23,17 @@ def check(name, cond, extra=""):
         failed += 1
         print(f"  FAIL {name}  {extra}")
 
-def run(kind, state, *extra, env=None):
+def run(kind, state=None, *extra, env=None):
     e = dict(os.environ)
     e.pop("TYPESAFE_API_KEY", None)
     e.pop("RAPTOR_JEV_MODE", None)
     if env:
         e.update(env)
-    p = subprocess.run(
-        [sys.executable, EXE, kind, "--state", json.dumps(state), *extra],
-        capture_output=True, text=True, env=e,
-    )
+    args = [sys.executable, EXE, kind]
+    if state is not None:
+        args += ["--state", json.dumps(state)]
+    args += list(extra)
+    p = subprocess.run(args, capture_output=True, text=True, env=e)
     try:
         out = json.loads(p.stdout)
     except Exception:
@@ -98,6 +99,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "usage":{"input_tokens":123,"output_tokens":45}}).encode()
         self.send_response(200)
         self.send_header("Content-Type","application/json")
+        self.send_header("X-Request-ID","fake-request-123")
         self.send_header("Content-Length",str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -114,11 +116,14 @@ def main():
           "raw_source" not in projected.get("coverage", {})
           and "raw_source" not in projected.get("pending_actions", [{}])[0])
     q = out.get("request", {}).get("questions", {})
-    check("next-action emits bounded typed questions",
+    check("next-action emits a slimmer bounded question set",
           q.get("next_action", {}).get("type") == "choice"
           and q.get("gain__A1", {}).get("type") == "score"
-          and q.get("frontier_needed__A1", {}).get("type") == "noul"
-          and q.get("executor__A1", {}).get("type") == "choice")
+          and q.get("duplicate_risk__A1", {}).get("type") == "noul"
+          and q.get("deterministic_first__A1", {}).get("type") == "noul"
+          and "none_of_these" in q.get("next_action", {}).get("criteria", {})
+          and "frontier_needed__A1" not in q
+          and "executor__A1" not in q)
 
     rc, out, text = run("next-action", st)
     check("missing key is non-blocking unavailable (exit 4)",
@@ -145,10 +150,12 @@ def main():
           "raw_source" not in route_projected.get("result", {})
           and "evidence" not in route_projected.get("result", {})
           and "raw_source" not in route_projected.get("ledger_context", {}))
-    criteria = out["request"]["questions"]["route"]["criteria"]
-    forbidden = {"confirm","confirmed","reject","rejected","downgrade","covered","safe","suppress"}
-    check("route vocabulary has no terminal disposition",
-          not any(word in " ".join(criteria.keys()).lower().split() for word in forbidden))
+    route_questions = out["request"]["questions"]
+    check("route-result uses independent Noul signals, not a forced Choice",
+          "route" not in route_questions
+          and route_questions.get("route__run_deterministic_check", {}).get("type") == "noul"
+          and route_questions.get("route__escalate_frontier", {}).get("type") == "noul"
+          and route_questions.get("route__open_or_join_candidate", {}).get("type") == "noul")
 
     with socketserver.TCPServer(("127.0.0.1", 0), Handler) as srv:
         port = srv.server_address[1]
@@ -171,6 +178,13 @@ def main():
                   rec.get("decision",{}).get("recommended_action") == "A2"
                   and rec.get("decision",{}).get("policy_selected_action") is None)
             check("receipt log written", Path(log).exists() and Path(log).read_text().strip())
+            check("receipt is auditable with decision id + safe action snapshot",
+                  rec.get("decision_id","").startswith("J-")
+                  and rec.get("decision_context",{}).get("actions",[{}])[0].get("summary") == "Run a deterministic diff")
+            check("transport telemetry records latency/attempt/request id",
+                  rec.get("transport",{}).get("attempts") == 1
+                  and rec.get("transport",{}).get("latency_ms") is not None
+                  and rec.get("transport",{}).get("request_id") == "fake-request-123")
             check("API key never appears in receipt/output",
                   "test-key" not in json.dumps(rec) and "test-key" not in text)
 
@@ -187,6 +201,26 @@ def main():
                   and d.get("policy_selected_action") == "A1"
                   and d.get("policy_override") == "mandatory-work-precedence")
 
+            Handler.choice = "A2"
+            rc, out, _ = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "reorder", env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("active reorder is fail-closed until explicitly enabled",
+                  rc == 0 and d.get("recommended_action") == "A2"
+                  and d.get("policy_selected_action") is None
+                  and d.get("policy_override") == "reorder-disabled-until-calibrated")
+
+            rc, out, _ = run(
+                "next-action", st, "--base-url", f"http://127.0.0.1:{port}",
+                "--mode", "reorder",
+                env={"TYPESAFE_API_KEY":"test-key", "RAPTOR_JEV_REORDER_ENABLE":"1"}
+            )
+            d = out.get("receipt",{}).get("decision",{})
+            check("explicit calibrated reorder opt-in can select non-mandatory work",
+                  rc == 0 and d.get("policy_selected_action") == "A2")
+
             Handler.calls = 0
             Handler.retry_counts = []
             Handler.force_first_500 = True
@@ -202,13 +236,54 @@ def main():
 
             rc, out, _ = run(
                 "route-result", route_state, "--base-url", f"http://127.0.0.1:{port}",
-                "--mode", "advisory", env={"TYPESAFE_API_KEY":"test-key"}
+                "--mode", "advisory", "--receipt-log", log,
+                env={"TYPESAFE_API_KEY":"test-key"}
             )
-            d = out.get("receipt",{}).get("decision",{})
-            check("route-result is planner-only",
+            route_rec = out.get("receipt",{})
+            d = route_rec.get("decision",{})
+            check("route-result is planner-only and non-exclusive",
                   rc == 0
-                  and out["receipt"]["authority"] == "planner-only-non-dispositive"
-                  and d.get("policy_selected_route") is None)
+                  and route_rec["authority"] == "planner-only-non-dispositive"
+                  and d.get("policy_selected_routes") == []
+                  and d.get("reorder_enabled_for_result_routes") is False
+                  and len(d.get("ranked_routes",[])) == 6)
+            check("route receipt logs the safe action/result context",
+                  route_rec.get("decision_context",{}).get("action",{}).get("id") == "A1"
+                  and route_rec.get("decision_context",{}).get("result",{}).get("summary") == "Found a concrete mismatch")
+
+            decision_id = rec["decision_id"]
+            rc, obs_out, _ = run(
+                "observe", None,
+                "--decision-id", decision_id,
+                "--record", json.dumps({
+                    "baseline_selected_action":"A1",
+                    "executed_action":"A1",
+                    "gate_closed":True,
+                    "deterministic_sufficient":True,
+                    "frontier_reasoning_used":False,
+                    "raw_source":"DROP"
+                }),
+                "--receipt-log", log
+            )
+            check("outcome observation appends correlation event",
+                  rc == 0
+                  and obs_out.get("observation",{}).get("decision_id") == decision_id
+                  and "raw_source" not in obs_out.get("observation",{}).get("observation",{}))
+            events = [json.loads(line) for line in Path(log).read_text().splitlines() if line.strip()]
+            check("decision log now supports closed-loop calibration",
+                  any(e.get("event") == "decision" and e.get("decision_id") == decision_id for e in events)
+                  and any(e.get("event") == "outcome_observation" and e.get("decision_id") == decision_id for e in events))
+            bad_log = str(Path(td)/"planner"/"jev-failures.jsonl")
+            rc, fail_out, _ = run(
+                "next-action", st, "--base-url", "http://127.0.0.1:1",
+                "--mode", "shadow", "--timeout", "0.05", "--receipt-log", bad_log,
+                env={"TYPESAFE_API_KEY":"test-key"}
+            )
+            fail_events = [json.loads(line) for line in Path(bad_log).read_text().splitlines() if line.strip()]
+            check("service failure is logged and baseline remains available",
+                  rc == 4 and fail_out.get("baseline_behavior") == "continue RAPTOR without Jev"
+                  and fail_events[-1].get("event") == "decision_failure"
+                  and fail_events[-1].get("transport",{}).get("attempts") >= 1)
         srv.shutdown()
 
     print(f"\n{passed} passed, {failed} failed")
