@@ -4,7 +4,7 @@ This fork integrates TypeSafe Jev as an optional **planner advisor** for `raptor
 
 ## Why Jev belongs here
 
-Jev is a System One decision model: application state plus typed questions in, typed judgments and probabilities out. That maps well to the orchestration decisions RAPTOR repeatedly makes *after* it has already enumerated a bounded action set: which action to run next, whether a deterministic check should precede a frontier-model call, which executor role fits the action, and how to route a completed worker/explorer result.
+Jev is a System One decision model: application state plus typed questions in, typed judgments and probabilities out. That maps well to the orchestration decisions RAPTOR repeatedly makes *after* it has already enumerated a bounded action set: which action to run next, whether a deterministic check should precede another reasoning call, and which *independent additive follow-ups* apply to a completed worker/explorer result.
 
 Jev does **not** replace the creative generator, skeptical judge, live verifier, boundary scout, specialist reasoner, or ledger. It is the scheduler/router between those seats.
 
@@ -16,9 +16,8 @@ It may:
 - recommend ordering among already-enumerated planner actions;
 - score expected information gain;
 - estimate duplication risk;
-- recommend deterministic-first versus frontier-model work;
-- recommend an executor class;
-- route a completed result into additive follow-up work.
+- recommend deterministic-first work;
+- route a completed result into one or more independent additive follow-ups.
 
 It may never:
 - confirm or correct a finding;
@@ -51,9 +50,9 @@ This preserves RAPTOR's raw-source isolation: generator, judge, and verifier sti
 | `off` | Baseline RAPTOR; no Jev call. |
 | `shadow` | Call/log Jev, but do not change scheduling. **Default.** |
 | `advisory` | Surface the recommendation to the orchestrator; the orchestrator still chooses. |
-| `reorder` | Jev may choose/reorder only non-mandatory planner work. Mandatory ledger/coverage work always wins. |
+| `reorder` | Reserved active-routing mode. It remains fail-closed unless `RAPTOR_JEV_REORDER_ENABLE=1`; mandatory ledger/coverage work always wins. |
 
-Promote a deployment from `shadow` only after comparing representative Jev recommendations against eventual ledger outcomes. Do not invent a universal confidence threshold; calibrate on the hunt workload.
+Do **not** promote from `shadow` just because calls succeed. Every decision must be correlated to what baseline RAPTOR actually chose and what happened afterward. Use `observe` events (below) and evaluate representative runs. Do not invent a universal confidence threshold; calibrate on the hunt workload. `reorder` is deliberately disabled by default even when the mode is requested.
 
 ## API configuration
 
@@ -65,6 +64,7 @@ Environment variables:
 - `TYPESAFE_DEFAULT_MODEL` - optional; defaults to `jev-latest`.
 - `RAPTOR_JEV_MODE` - `off|shadow|advisory|reorder`.
 - `RAPTOR_JEV_TIMEOUT` - timeout per HTTP attempt in seconds; default 10.
+- `RAPTOR_JEV_REORDER_ENABLE` - explicit opt-in (`1|true|yes`) required before non-mandatory active reorder can occur.
 
 The request target is `POST /v1/systemone` with bearer authorization. Missing credentials, timeouts, transient service failures, or malformed responses are **non-blocking**: the helper exits 4 and the hunt continues with baseline RAPTOR behavior. The API key is never written into a receipt.
 
@@ -78,13 +78,13 @@ Invoke:
       --state @planner-state.json \
       --receipt-log "$OUTPUT_DIR/planner/jev-decisions.jsonl"
 
-The adapter asks independent typed questions in one request:
-- `Choice`: best next action;
+The adapter intentionally keeps this request smaller than v1:
+- `Choice`: best next action, with an explicit `none_of_these` outcome so Jev is never forced to pick a bad action;
 - `Score`: expected information gain for each action;
 - `Noul`: duplication risk for each action;
-- `Noul`: deterministic-first for each action;
-- `Noul`: frontier-model reasoning needed for each action;
-- `Choice`: executor class (`deterministic_tool`, `explorer`, `worker`, `brain`, `validator`, `specialist`).
+- `Noul`: deterministic-first for each action.
+
+Executor-role and frontier-needed questions are **not fanned out over every action** in v2; the first real run showed that doing so consumed thousands of unnecessary input/output tokens. RAPTOR keeps its existing role selection until a narrower second-stage decision is justified by calibration.
 
 Probabilities are planner signals, not permission to disposition a candidate.
 
@@ -96,7 +96,7 @@ After a deterministic tool or subagent returns, provide only a bounded planner-v
       --state @result-routing-state.json \
       --receipt-log "$OUTPUT_DIR/planner/jev-decisions.jsonl"
 
-The route vocabulary is deliberately additive:
+The route dimensions are deliberately **independent Noul judgments**, not one `Choice`. Several may legitimately apply at once:
 - `open_or_join_candidate`
 - `attach_planner_evidence`
 - `run_deterministic_check`
@@ -104,19 +104,39 @@ The route vocabulary is deliberately additive:
 - `needs_more_evidence`
 - `possible_duplicate_review`
 
+This is load-bearing: a result can require both a deterministic check **and** later frontier review while also being candidate-worthy. TypeSafe's own primitive guidance says to use one Noul per label when several labels may apply. v1 incorrectly forced these compatible routes through one Choice; v2 removes that information loss. Result-route reorder remains disabled until these signals are calibrated.
+
 There is intentionally no `reject`, `confirm`, `safe`, `covered`, or severity decision. `possible_duplicate_review` merely schedules the ordinary same-engagement dedup check; it never drops the branch itself.
 
 ## Mandatory-work precedence
 
 Before calling Jev, mark mechanically required work as `mandatory: true`: open ledger pending actions, coverage/completeness obligations, required independent reviews, conformance failures, dirty sweeps, handoff blockers, or other already-derived gates.
 
-In `reorder` mode the helper deterministically selects the highest-priority mandatory action even if Jev recommends something else, and records `mandatory-work-precedence` as the override. Jev therefore cannot starve a closure obligation.
+In `reorder` mode the helper deterministically selects the highest-priority mandatory action even if Jev recommends something else, and records `mandatory-work-precedence` as the override. For non-mandatory work, active selection remains disabled unless `RAPTOR_JEV_REORDER_ENABLE=1`. Jev therefore cannot starve a closure obligation or silently become active merely because someone changed the mode string.
 
-## Planner receipts
+## Planner receipts and closed-loop calibration
 
-Each live call may append one JSONL record to `<OUTPUT_DIR>/planner/jev-decisions.jsonl` containing state/request digests, decision kind/mode, requested/used model, token usage, typed recommendation/probabilities, mandatory-work overrides, and hard authority guards.
+Every live decision now appends an auditable JSONL record to `<OUTPUT_DIR>/planner/jev-decisions.jsonl` containing:
+- a stable `decision_id`;
+- the **safe projected action/result context**, not merely opaque digests;
+- state/request digests;
+- decision kind/mode and typed probabilities;
+- requested/used model and token usage;
+- HTTP latency, attempt/retry count, status, and request id when supplied;
+- mandatory-work overrides and hard authority guards.
 
-This sidecar is **not** the candidate ledger and is not evidence for a disposition. It is observability/evaluation data. Over time it becomes a calibration corpus: compare Jev's recommendation with what the RAPTOR ledger eventually showed (gate closed, candidate opened, branch dry, deterministic check sufficient, or frontier reasoning actually needed).
+API failures are logged as `decision_failure` events too, while RAPTOR continues with baseline scheduling.
+
+Shadow mode is useful only if the recommendation is correlated with what RAPTOR actually did. After baseline scheduling/execution, append an outcome observation:
+
+    python3 scripts/raptor-loop-jev observe \
+      --decision-id J-... \
+      --record '{"baseline_selected_action":"A2","executed_action":"A2","gate_closed":true,"deterministic_sufficient":false,"frontier_reasoning_used":true}' \
+      --receipt-log "$OUTPUT_DIR/planner/jev-decisions.jsonl"
+
+Supported observations include baseline/executed action, executed routes, result class, whether a gate closed or candidate opened, whether deterministic work sufficed, whether frontier reasoning was actually used, and bounded tool/agent ids/notes. Unknown fields are dropped.
+
+This sidecar is **not** the candidate ledger and is not evidence for a disposition. It is evaluation data. Promotion decisions must be based on matched decision/outcome records, not Jev confidence alone.
 
 ## Failure asymmetry
 
