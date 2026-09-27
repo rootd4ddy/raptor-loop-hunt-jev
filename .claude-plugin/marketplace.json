@@ -3,13 +3,13 @@
   "owner": {
     "name": "Nicolas Krassas"
   },
-  "description": "RAPTOR security-research skills for Claude Code.",
+  "description": "RAPTOR security-research skills with optional TypeSafe Jev planner routing.",
   "plugins": [
     {
       "name": "raptor-loop-hunt",
       "source": "./",
-      "description": "Autonomous looping multi-altitude vulnerability hunt (generate -> judge -> verify).",
-      "version": "1.0.1"
+      "description": "Autonomous multi-altitude vulnerability hunt with generate -> judge -> verify plus optional Jev planning.",
+      "version": "1.1.0"
     }
   ]
 }
