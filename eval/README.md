@@ -18,6 +18,15 @@ Two tiers, by what the axis needs to run:
   run produced, never by the executor's own report. One seed is a smoke test, not a benchmark —
   multiply seeds and say which was done. See `fixtures/` for the format and a worked example.
 
+### Jev planner control-plane regression suite
+
+The optional Jev integration has a separate deterministic suite, `scripts/test-raptor-loop-jev`.
+It is **not a thirteenth vulnerability-quality axis**: it tests the scheduler's authority boundary and
+wire adapter, not finding recall. The suite uses a local fake System One endpoint (no external network)
+to check bounded state projection, typed Choice/Noul/Score construction, missing-key fallback,
+shadow/advisory/reorder semantics, mandatory-work precedence, retry marking, receipt logging, and that
+completed-result routing has no terminal security-disposition vocabulary.
+
 ## The axes
 
 | # | Axis | Trap (tempting failure) | Tier | Where enforced / measured |
