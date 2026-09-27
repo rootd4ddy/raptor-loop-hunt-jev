@@ -1,0 +1,27 @@
+name: RAPTOR Jev self-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, "jev-planner-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  self-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Python helpers
+        run: |
+          python3 -m py_compile             scripts/raptor-loop-jev             scripts/test-raptor-loop-jev             scripts/raptor-loop-exec             scripts/test-raptor-loop-exec             scripts/raptor-loop-ledger             scripts/test-raptor-loop-ledger
+      - name: Jev planner tests
+        run: python3 scripts/test-raptor-loop-jev
+      - name: Execution broker tests
+        run: python3 scripts/test-raptor-loop-exec
+      - name: Ledger tests
+        run: python3 scripts/test-raptor-loop-ledger
