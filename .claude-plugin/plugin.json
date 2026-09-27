@@ -1,11 +1,11 @@
 {
   "name": "raptor-loop-hunt",
-  "description": "Autonomous, looping, multi-altitude security vulnerability hunt for a codebase — the RAPTOR 'Karpathy auto-research' generate -> adversarially-judge -> verify loop that finds far more bugs than a single-pass scan.",
-  "version": "1.0.1",
+  "description": "Autonomous RAPTOR generate -> judge -> verify vulnerability hunting with an optional TypeSafe Jev planner/control plane.",
+  "version": "1.1.0",
   "author": {
     "name": "Nicolas Krassas"
   },
-  "homepage": "https://github.com/dinosn/raptor-loop-hunt",
-  "repository": "https://github.com/dinosn/raptor-loop-hunt",
+  "homepage": "https://github.com/rootd4ddy/raptor-loop-hunt-jev",
+  "repository": "https://github.com/rootd4ddy/raptor-loop-hunt-jev",
   "license": "MIT"
 }
