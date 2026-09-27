@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""raptor-loop-jev — planner-only TypeSafe Jev advisor for raptor-loop-hunt.
+
+Jev is intentionally kept OUTSIDE the authoritative candidate/coverage state machine.
+It may prioritize or route planner work, but it may never confirm, reject, downgrade,
+cover, suppress, or mark a finding safe. The RAPTOR ledger remains authoritative.
+
+Two bounded decision presets are exposed:
+
+  next-action   Rank a pre-enumerated action set and advise executor/model routing.
+  route-result  Triage a completed subagent/tool result into additive follow-up work.
+
+State sent to Jev is projected through a strict allowlist. Raw source, secrets, PoC
+bytes, credentials, full tool transcripts, and arbitrary target files are excluded.
+
+Modes (RAPTOR_JEV_MODE or --mode):
+  off       no network call; baseline RAPTOR behavior
+  shadow    record Jev's decision but do not let it change scheduling (default)
+  advisory  expose a recommendation for the orchestrator to consider
+  reorder   allow Jev to reorder only NON-MANDATORY planner work; mandatory ledger /
+            coverage work always wins and Jev still cannot disposition candidates
+
+Environment:
+  TYPESAFE_API_KEY       required for live calls
+  TYPESAFE_BASE_URL      default https://api.typesafe.ai
+  TYPESAFE_DEFAULT_MODEL default jev-latest
+  RAPTOR_JEV_MODE        off|shadow|advisory|reorder (default shadow)
+  RAPTOR_JEV_TIMEOUT     per-attempt seconds (default 10)
+
+Pure stdlib. No TypeSafe SDK dependency.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+METHODOLOGY_VERSION = "jev-planner-v1"
+DEFAULT_BASE_URL = "https://api.typesafe.ai"
+DEFAULT_MODEL = "jev-latest"
+DEFAULT_TIMEOUT = 10.0
+DEFAULT_MODE = "shadow"
+MAX_STATE_BYTES = 64 * 1024
+MAX_ACTIONS = 16
+MAX_TEXT = 2400
+MAX_LIST = 32
+MAX_RETRIES = 2
+RETRY_STATUSES = {408, 429, 500, 501, 502, 503, 504, 505, 506, 507, 508, 510, 511, 529}
+_ACTION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_MODES = {"off", "shadow", "advisory", "reorder"}
+
+_TOP_LEVEL_ALLOW = {
+    "run_id", "target_label", "goal", "round", "altitude", "bug_class",
+    "dry_rounds", "coverage", "pending_actions", "constraints", "recent_tried",
+}
+_ACTION_ALLOW = {
+    "id", "summary", "evidence_gap", "kind", "mandatory", "queue_rank", "cost",
+    "deterministic_eligible", "coverage_cell", "pending_action",
+}
+_RESULT_ALLOW = {
+    "summary", "claims", "evidence", "tool_status", "produced_candidate_id",
+    "changed_files", "open_questions",
+}
+_ROUTE_ALLOW = {"action", "result", "ledger_context", "goal", "run_id", "target_label"}
+
+GAIN_LEVELS = [
+    "Likely adds no meaningful net-new evidence or substantially repeats existing work.",
+    "Likely adds a small clarification but does not materially change the current evidence state.",
+    "Likely adds useful net-new evidence or resolves one bounded uncertainty.",
+    "Likely closes a material evidence gate or opens a distinct, testable research branch.",
+    "Likely provides decisive net-new evidence that materially advances or closes the current objective.",
+]
+EXECUTOR_CRITERIA = {
+    "deterministic_tool": "The step is bounded and should be handled first by deterministic code, a query, parser, diff, test, or other non-generative tool.",
+    "explorer": "The step needs broad but lightweight exploration of a new slice or hypothesis space.",
+    "worker": "The step is a concrete implementation, reproduction, extraction, or bounded engineering task.",
+    "brain": "The step requires deep synthesis across multiple artifacts, hypotheses, or architectural layers.",
+    "validator": "The step primarily needs independent verification or an attempt to falsify an existing claim.",
+    "specialist": "The step requires a domain-specific specialist role already available to the orchestrator.",
+}
+ROUTE_CRITERIA = {
+    "open_or_join_candidate": "The result contains a concrete security defect observation that should open or join a RAPTOR candidate. This only increases scrutiny; it is not confirmation.",
+    "attach_planner_evidence": "The result adds useful evidence to an existing lead, action, or candidate but is not itself a concrete new defect.",
+    "run_deterministic_check": "The result exposes a bounded falsifiable question best answered by a deterministic tool, test, query, or diff before more model reasoning.",
+    "escalate_frontier": "The result is ambiguous, cross-layer, or hypothesis-rich enough that a frontier reasoning model should inspect it next.",
+    "needs_more_evidence": "The result is not sufficient to choose a stronger route yet; gather additional evidence without suppressing the branch.",
+    "possible_duplicate_review": "The result appears related to already-known work and should be checked for duplication, but it must NOT be dropped or dispositioned on this judgment alone.",
+}
+
+
+class JevUnavailable(RuntimeError):
+    pass
+
+
+class JevBadInput(ValueError):
+    pass
+
+
+def _canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _sha(obj) -> str:
+    return "sha256:" + hashlib.sha256(_canonical(obj)).hexdigest()
+
+
+def _cap(value, n: int = MAX_TEXT):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        value = " ".join(value.split())
+        return value if len(value) <= n else value[: n - 1] + "…"
+    if isinstance(value, list):
+        return [_cap(v, n) for v in value[:MAX_LIST]]
+    if isinstance(value, dict):
+        out = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= MAX_LIST:
+                break
+            out[_cap(str(k), 128)] = _cap(v, n)
+        return out
+    return _cap(str(value), n)
+
+
+def _project_top_level(state: dict) -> dict:
+    return {k: _cap(state[k]) for k in _TOP_LEVEL_ALLOW if k in state}
+
+
+def _project_action(action: dict) -> dict:
+    if not isinstance(action, dict):
+        raise JevBadInput("each action must be a JSON object")
+    aid = str(action.get("id", "")).strip()
+    if not _ACTION_ID.fullmatch(aid):
+        raise JevBadInput(f"invalid action id {aid!r}; use 1-64 chars [A-Za-z0-9._:-]")
+    summary = str(action.get("summary", "")).strip()
+    if not summary:
+        raise JevBadInput(f"action {aid!r} requires a non-empty summary")
+    out = {k: _cap(action[k]) for k in _ACTION_ALLOW if k in action}
+    out["id"] = aid
+    out["summary"] = _cap(summary)
+    out["mandatory"] = bool(action.get("mandatory", False))
+    return out
+
+
+def _project_next_action_state(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise JevBadInput("state must be a JSON object")
+    actions = raw.get("actions")
+    if not isinstance(actions, list) or not actions:
+        raise JevBadInput("state.actions must be a non-empty array")
+    if len(actions) > MAX_ACTIONS:
+        raise JevBadInput(f"state.actions exceeds MAX_ACTIONS={MAX_ACTIONS}")
+    projected = _project_top_level(raw)
+    projected_actions = [_project_action(a) for a in actions]
+    ids = [a["id"] for a in projected_actions]
+    if len(set(ids)) != len(ids):
+        raise JevBadInput("action ids must be unique")
+    projected["actions"] = projected_actions
+    projected["planner_contract"] = {
+        "objective": "maximize net-new evidence and close uncovered RAPTOR gates without repeating work",
+        "jev_authority": "planner-advisory-only",
+        "forbidden_effects": ["confirm", "reject", "downgrade", "cover", "suppress", "mark_safe"],
+        "mandatory_work_cannot_be_skipped": True,
+    }
+    if len(_canonical(projected)) > MAX_STATE_BYTES:
+        raise JevBadInput(f"projected state exceeds {MAX_STATE_BYTES} bytes")
+    return projected
+
+
+def _project_route_state(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise JevBadInput("state must be a JSON object")
+    out = {}
+    for k in _ROUTE_ALLOW:
+        if k not in raw:
+            continue
+        if k == "action":
+            out[k] = _project_action(raw[k])
+        elif k == "result":
+            if not isinstance(raw[k], dict):
+                raise JevBadInput("state.result must be an object")
+            out[k] = {rk: _cap(raw[k][rk]) for rk in _RESULT_ALLOW if rk in raw[k]}
+        else:
+            out[k] = _cap(raw[k])
+    if "action" not in out or "result" not in out:
+        raise JevBadInput("route-result requires state.action and state.result")
+    out["planner_contract"] = {
+        "objective": "route follow-up work without making authoritative security dispositions",
+        "jev_authority": "planner-advisory-only",
+        "forbidden_effects": ["confirm", "reject", "downgrade", "cover", "suppress", "mark_safe"],
+    }
+    if len(_canonical(out)) > MAX_STATE_BYTES:
+        raise JevBadInput(f"projected state exceeds {MAX_STATE_BYTES} bytes")
+    return out
+
+
+def _action_label(a: dict) -> str:
+    parts = [a["summary"]]
+    if a.get("evidence_gap"):
+        parts.append(f"Evidence gap: {a['evidence_gap']}")
+    if a.get("kind"):
+        parts.append(f"Declared kind: {a['kind']}")
+    if a.get("deterministic_eligible") is not None:
+        parts.append(f"Deterministic-eligible: {bool(a['deterministic_eligible'])}")
+    if a.get("mandatory"):
+        parts.append("MANDATORY planner/ledger work.")
+    return " ".join(parts)
+
+
+def _next_action_questions(state: dict) -> dict:
+    actions = state["actions"]
+    questions = {
+        "next_action": {
+            "type": "choice",
+            "instructions": (
+                "Which pre-enumerated action should the RAPTOR orchestrator run next to maximize "
+                "net-new evidence and close the most important current gap, while avoiding repetition? "
+                "This is scheduling only. Do not treat any option as a security disposition."
+            ),
+            "criteria": {a["id"]: _action_label(a) for a in actions},
+        }
+    }
+    for a in actions:
+        aid = a["id"]
+        ref = f"planner.actions entry with id '{aid}' ({a['summary']})"
+        questions[f"gain__{aid}"] = {
+            "type": "score",
+            "instructions": f"Rate the expected net-new information gain of {ref}.",
+            "criteria": GAIN_LEVELS,
+        }
+        questions[f"duplicate_risk__{aid}"] = {
+            "type": "noul",
+            "instructions": (
+                f"Is {ref} substantially duplicative of work already represented by "
+                "planner.recent_tried, pending actions, coverage state, or the other proposed actions?"
+            ),
+            "criteria": {
+                "true": "It largely repeats an already-tested path or does not add a distinct evidence gate.",
+                "false": "It is materially distinct or contributes net-new evidence/coverage.",
+            },
+        }
+        questions[f"deterministic_first__{aid}"] = {
+            "type": "noul",
+            "instructions": (
+                f"Should {ref} be attempted first with deterministic tools/tests/diffs/queries rather "
+                "than spending a frontier-model reasoning call, assuming declared prerequisites are met?"
+            ),
+            "criteria": {
+                "true": "A bounded deterministic operation can answer the immediate question first.",
+                "false": "The immediate question needs semantic synthesis or open-ended hypothesis generation.",
+            },
+        }
+        questions[f"frontier_needed__{aid}"] = {
+            "type": "noul",
+            "instructions": (
+                f"Does {ref} require open-ended frontier-model reasoning to make useful progress after "
+                "any obvious deterministic prerequisite?"
+            ),
+            "criteria": {
+                "true": "Useful progress depends on deep synthesis, hypothesis generation, or cross-layer reasoning.",
+                "false": "The work is bounded enough for deterministic tooling or a narrow worker/explorer task.",
+            },
+        }
+        questions[f"executor__{aid}"] = {
+            "type": "choice",
+            "instructions": f"Which executor class best fits {ref}?",
+            "criteria": EXECUTOR_CRITERIA,
+        }
+    return questions
+
+
+def _route_questions(state: dict) -> dict:
+    action = state["action"]
+    return {
+        "route": {
+            "type": "choice",
+            "instructions": (
+                f"How should the RAPTOR orchestrator route the completed result for action "
+                f"'{action['id']}'? Choose an additive follow-up route only. Never confirm, reject, "
+                "downgrade, cover, suppress, or mark a finding safe."
+            ),
+            "criteria": ROUTE_CRITERIA,
+        },
+        "contains_new_claim": {
+            "type": "noul",
+            "instructions": "Does planner.result contain a materially new technical claim that was not already established in the supplied planner context?",
+        },
+        "candidate_worthy": {
+            "type": "noul",
+            "instructions": (
+                "Does planner.result contain a concrete defect observation specific enough that "
+                "opening or joining a RAPTOR candidate would be warranted? Opening a candidate only raises scrutiny."
+            ),
+        },
+        "deterministic_check_available": {
+            "type": "noul",
+            "instructions": "Is there a bounded deterministic check/test/query/diff that should run before another frontier-model reasoning step?",
+        },
+        "frontier_review_needed": {
+            "type": "noul",
+            "instructions": "Does the result need deeper frontier-model synthesis or independent semantic review before the planner can choose a concrete next step?",
+        },
+    }
+
+
+def _load_json_arg(arg: str):
+    if arg == "-":
+        raw = sys.stdin.read()
+    elif arg.startswith("@"):
+        raw = Path(arg[1:]).read_text()
+    else:
+        raw = arg
+    return json.loads(raw)
+
+
+def _api_post(base_url: str, api_key: str, payload: dict, timeout: float, retries: int = MAX_RETRIES):
+    endpoint = base_url.rstrip("/") + "/v1/systemone"
+    body = _canonical(payload)
+    last = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": f"raptor-loop-hunt/{METHODOLOGY_VERSION}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+            obj = json.loads(raw)
+            if not isinstance(obj, dict) or not isinstance(obj.get("answers"), dict):
+                raise JevUnavailable("TypeSafe response missing answers object")
+            return obj
+        except urllib.error.HTTPError as e:
+            last = f"TypeSafe HTTP {e.code}"
+            if e.code not in RETRY_STATUSES or attempt >= retries:
+                raise JevUnavailable(last) from None
+            retry_after = e.headers.get("Retry-After")
+            try:
+                delay = min(5.0, max(0.0, float(retry_after))) if retry_after else min(0.5 * (2 ** attempt), 2.0)
+            except ValueError:
+                delay = min(0.5 * (2 ** attempt), 2.0)
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+            last = f"TypeSafe request failed ({type(e).__name__})"
+            if attempt >= retries:
+                raise JevUnavailable(last) from None
+            time.sleep(min(0.5 * (2 ** attempt), 2.0))
+    raise JevUnavailable(last or "TypeSafe request failed")
+
+
+def _answer_choice(answers: dict, name: str):
+    a = answers.get(name, {})
+    if not isinstance(a, dict) or a.get("type") != "choice":
+        return None
+    return {
+        "choice": a.get("choice"),
+        "confidence": a.get("confidence"),
+        "probabilities": a.get("probabilities", {}),
+    }
+
+
+def _collect_next_action(response: dict, state: dict, mode: str) -> dict:
+    answers = response.get("answers", {})
+    choice = _answer_choice(answers, "next_action") or {}
+    recommended = choice.get("choice")
+    action_ids = {a["id"] for a in state["actions"]}
+    if recommended not in action_ids:
+        recommended = None
+
+    per_action = {}
+    for a in state["actions"]:
+        aid = a["id"]
+        per_action[aid] = {
+            "gain": answers.get(f"gain__{aid}"),
+            "duplicate_risk": answers.get(f"duplicate_risk__{aid}"),
+            "deterministic_first": answers.get(f"deterministic_first__{aid}"),
+            "frontier_needed": answers.get(f"frontier_needed__{aid}"),
+            "executor": answers.get(f"executor__{aid}"),
+        }
+
+    mandatory = sorted(
+        (a for a in state["actions"] if a.get("mandatory")),
+        key=lambda x: (x.get("queue_rank", 10**9), x["id"]),
+    )
+    policy_selected = None
+    override = None
+    if mode == "reorder":
+        if mandatory:
+            policy_selected = mandatory[0]["id"]
+            if recommended and recommended != policy_selected:
+                override = "mandatory-work-precedence"
+        else:
+            policy_selected = recommended
+
+    return {
+        "recommended_action": recommended,
+        "recommendation": choice,
+        "per_action": per_action,
+        "policy_selected_action": policy_selected,
+        "policy_override": override,
+    }
+
+
+def _collect_route(response: dict, mode: str) -> dict:
+    answers = response.get("answers", {})
+    route = _answer_choice(answers, "route") or {}
+    return {
+        "recommended_route": route.get("choice"),
+        "recommendation": route,
+        "signals": {
+            "contains_new_claim": answers.get("contains_new_claim"),
+            "candidate_worthy": answers.get("candidate_worthy"),
+            "deterministic_check_available": answers.get("deterministic_check_available"),
+            "frontier_review_needed": answers.get("frontier_review_needed"),
+        },
+        "policy_selected_route": route.get("choice") if mode == "reorder" else None,
+    }
+
+
+def _receipt(kind: str, state: dict, payload: dict, response: dict, mode: str, decision: dict):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "methodology_version": METHODOLOGY_VERSION,
+        "decision_kind": kind,
+        "mode": mode,
+        "authority": "planner-only-non-dispositive",
+        "state_digest": _sha(state),
+        "request_digest": _sha(payload),
+        "model_requested": payload["model"],
+        "model_used": response.get("model"),
+        "usage": response.get("usage", {}),
+        "decision": decision,
+        "guards": [
+            "Jev cannot confirm/reject/downgrade/cover/suppress/mark-safe",
+            "mandatory ledger and coverage work cannot be skipped",
+            "raw source, secrets, credentials, PoC bytes, and arbitrary tool transcripts are excluded from Jev state",
+            "generator/judge/verifier raw-source isolation remains unchanged",
+        ],
+        "created_at": int(time.time()),
+    }
+
+
+def _append_receipt(path: str | None, rec: dict):
+    if not path:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(p), flags, 0o600)
+    try:
+        os.write(fd, _canonical(rec) + b"\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mode(arg_mode: str | None) -> str:
+    mode = (arg_mode or os.environ.get("RAPTOR_JEV_MODE") or DEFAULT_MODE).strip().lower()
+    if mode not in _MODES:
+        raise JevBadInput(f"invalid mode {mode!r}; expected one of {sorted(_MODES)}")
+    return mode
+
+
+def _build(kind: str, raw_state: dict, model: str):
+    if kind == "next-action":
+        state = _project_next_action_state(raw_state)
+        questions = _next_action_questions(state)
+    elif kind == "route-result":
+        state = _project_route_state(raw_state)
+        questions = _route_questions(state)
+    else:
+        raise JevBadInput(f"unknown decision kind {kind!r}")
+    payload = {"state": {"planner": state}, "model": model, "questions": questions}
+    return state, payload
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="raptor-loop-jev", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kind", choices=["next-action", "route-result"])
+    ap.add_argument("--state", required=True, help="JSON object, @file, or - for stdin")
+    ap.add_argument("--model", default=os.environ.get("TYPESAFE_DEFAULT_MODEL", DEFAULT_MODEL))
+    ap.add_argument("--base-url", default=os.environ.get("TYPESAFE_BASE_URL", DEFAULT_BASE_URL))
+    ap.add_argument("--timeout", type=float, default=float(os.environ.get("RAPTOR_JEV_TIMEOUT", DEFAULT_TIMEOUT)))
+    ap.add_argument("--mode", choices=sorted(_MODES), default=None)
+    ap.add_argument("--dry-run", action="store_true", help="print projected state + API request, no network")
+    ap.add_argument("--receipt-log", help="optional JSONL planner decision log")
+    args = ap.parse_args(argv)
+
+    try:
+        mode = _mode(args.mode)
+        raw_state = _load_json_arg(args.state)
+        state, payload = _build(args.kind, raw_state, args.model)
+    except (OSError, ValueError, json.JSONDecodeError, JevBadInput) as e:
+        print(json.dumps({"ok": False, "error": str(e), "decision_kind": args.kind}, indent=2))
+        return 2
+
+    if args.dry_run:
+        print(json.dumps({
+            "ok": True, "dry_run": True, "mode": mode, "decision_kind": args.kind,
+            "projected_state": state, "request": payload,
+        }, indent=2))
+        return 0
+
+    if mode == "off":
+        print(json.dumps({
+            "ok": False, "available": False, "reason": "RAPTOR_JEV_MODE=off",
+            "decision_kind": args.kind, "baseline_behavior": "continue RAPTOR without Jev",
+        }, indent=2))
+        return 4
+
+    api_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if not api_key:
+        print(json.dumps({
+            "ok": False, "available": False, "reason": "TYPESAFE_API_KEY is not set",
+            "decision_kind": args.kind, "baseline_behavior": "continue RAPTOR without Jev",
+        }, indent=2))
+        return 4
+
+    try:
+        response = _api_post(args.base_url, api_key, payload, args.timeout)
+        if args.kind == "next-action":
+            decision = _collect_next_action(response, state, mode)
+        else:
+            decision = _collect_route(response, mode)
+        rec = _receipt(args.kind, state, payload, response, mode, decision)
+        _append_receipt(args.receipt_log, rec)
+        print(json.dumps({"ok": True, "receipt": rec}, indent=2))
+        return 0
+    except (JevUnavailable, OSError, ValueError) as e:
+        print(json.dumps({
+            "ok": False, "available": False, "reason": str(e),
+            "decision_kind": args.kind, "baseline_behavior": "continue RAPTOR without Jev",
+        }, indent=2))
+        return 4
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
