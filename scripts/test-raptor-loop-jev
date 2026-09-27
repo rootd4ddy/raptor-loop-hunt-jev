@@ -44,7 +44,8 @@ def base_state():
         "run_id": "r1",
         "goal": "close the current evidence gate",
         "round": 7,
-        "coverage": {"covered": 8, "total": 10},
+        "coverage": {"covered": 8, "total": 10, "raw_source": "DROP-NESTED"},
+        "pending_actions": [{"id":"P1","kind":"dirty_sweep","summary":"sweep one file","raw_source":"DROP-PENDING"}],
         "recent_tried": ["old path"],
         "actions": [
             {"id": "A1", "summary": "Run a deterministic diff", "kind": "deterministic",
@@ -109,6 +110,9 @@ def main():
     projected = out.get("projected_state", {})
     check("state projection drops raw source and credentials",
           "raw_source" not in projected and "credentials" not in projected)
+    check("nested planner projection drops unknown/raw fields",
+          "raw_source" not in projected.get("coverage", {})
+          and "raw_source" not in projected.get("pending_actions", [{}])[0])
     q = out.get("request", {}).get("questions", {})
     check("next-action emits bounded typed questions",
           q.get("next_action", {}).get("type") == "choice"
@@ -132,9 +136,15 @@ def main():
     route_state = {
         "goal":"triage result",
         "action":{"id":"A1","summary":"Inspect one path"},
-        "result":{"summary":"Found a concrete mismatch", "claims":["x"], "raw_source":"DROP"},
+        "result":{"summary":"Found a concrete mismatch", "claims":["x"], "evidence_labels":["static-diff"], "raw_source":"DROP", "evidence":{"source":"DROP-EVIDENCE"}},
+        "ledger_context":{"candidate_id":"C-1","candidate_state":"open","raw_source":"DROP-LEDGER"},
     }
     rc, out, _ = run("route-result", route_state, "--dry-run")
+    route_projected = out.get("projected_state", {})
+    check("route projection drops nested raw evidence/context",
+          "raw_source" not in route_projected.get("result", {})
+          and "evidence" not in route_projected.get("result", {})
+          and "raw_source" not in route_projected.get("ledger_context", {}))
     criteria = out["request"]["questions"]["route"]["criteria"]
     forbidden = {"confirm","confirmed","reject","rejected","downgrade","covered","safe","suppress"}
     check("route vocabulary has no terminal disposition",
