@@ -42,8 +42,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-SCHEMA_VERSION = 1
-METHODOLOGY_VERSION = "jev-planner-v1"
+SCHEMA_VERSION = 2
+METHODOLOGY_VERSION = "jev-planner-v2"
 DEFAULT_BASE_URL = "https://api.typesafe.ai"
 DEFAULT_MODEL = "jev-latest"
 DEFAULT_TIMEOUT = 10.0
@@ -81,21 +81,13 @@ GAIN_LEVELS = [
     "Likely closes a material evidence gate or opens a distinct, testable research branch.",
     "Likely provides decisive net-new evidence that materially advances or closes the current objective.",
 ]
-EXECUTOR_CRITERIA = {
-    "deterministic_tool": "The step is bounded and should be handled first by deterministic code, a query, parser, diff, test, or other non-generative tool.",
-    "explorer": "The step needs broad but lightweight exploration of a new slice or hypothesis space.",
-    "worker": "The step is a concrete implementation, reproduction, extraction, or bounded engineering task.",
-    "brain": "The step requires deep synthesis across multiple artifacts, hypotheses, or architectural layers.",
-    "validator": "The step primarily needs independent verification or an attempt to falsify an existing claim.",
-    "specialist": "The step requires a domain-specific specialist role already available to the orchestrator.",
-}
-ROUTE_CRITERIA = {
-    "open_or_join_candidate": "The result contains a concrete security defect observation that should open or join a RAPTOR candidate. This only increases scrutiny; it is not confirmation.",
-    "attach_planner_evidence": "The result adds useful evidence to an existing lead, action, or candidate but is not itself a concrete new defect.",
-    "run_deterministic_check": "The result exposes a bounded falsifiable question best answered by a deterministic tool, test, query, or diff before more model reasoning.",
-    "escalate_frontier": "The result is ambiguous, cross-layer, or hypothesis-rich enough that a frontier reasoning model should inspect it next.",
-    "needs_more_evidence": "The result is not sufficient to choose a stronger route yet; gather additional evidence without suppressing the branch.",
-    "possible_duplicate_review": "The result appears related to already-known work and should be checked for duplication, but it must NOT be dropped or dispositioned on this judgment alone.",
+ROUTE_SIGNALS = {
+    "open_or_join_candidate": "Does the result contain a concrete defect observation specific enough to open or join a RAPTOR candidate? Opening a candidate only raises scrutiny.",
+    "attach_planner_evidence": "Does the result add materially useful evidence to an existing lead, action, or candidate?",
+    "run_deterministic_check": "Is there a bounded falsifiable check/test/query/diff that should run before more model reasoning?",
+    "escalate_frontier": "After obvious deterministic checks, does this result still need deeper frontier-model synthesis or independent semantic review?",
+    "needs_more_evidence": "Is the supplied result insufficient to choose a concrete technical next step without gathering more evidence?",
+    "possible_duplicate_review": "Does the result appear materially related to already-known same-engagement work such that ordinary dedup review is warranted? This never drops the result by itself.",
 }
 
 
@@ -294,57 +286,22 @@ def _next_action_questions(state: dict) -> dict:
                 "false": "The immediate question needs semantic synthesis or open-ended hypothesis generation.",
             },
         }
-        questions[f"frontier_needed__{aid}"] = {
-            "type": "noul",
-            "instructions": (
-                f"Does {ref} require open-ended frontier-model reasoning to make useful progress after "
-                "any obvious deterministic prerequisite?"
-            ),
-            "criteria": {
-                "true": "Useful progress depends on deep synthesis, hypothesis generation, or cross-layer reasoning.",
-                "false": "The work is bounded enough for deterministic tooling or a narrow worker/explorer task.",
-            },
-        }
-        questions[f"executor__{aid}"] = {
-            "type": "choice",
-            "instructions": f"Which executor class best fits {ref}?",
-            "criteria": EXECUTOR_CRITERIA,
-        }
     return questions
 
 
 def _route_questions(state: dict) -> dict:
-    action = state["action"]
-    return {
-        "route": {
-            "type": "choice",
-            "instructions": (
-                f"How should the RAPTOR orchestrator route the completed result for action "
-                f"'{action['id']}'? Choose an additive follow-up route only. Never confirm, reject, "
-                "downgrade, cover, suppress, or mark a finding safe."
-            ),
-            "criteria": ROUTE_CRITERIA,
-        },
+    questions = {
         "contains_new_claim": {
             "type": "noul",
             "instructions": "Does planner.result contain a materially new technical claim that was not already established in the supplied planner context?",
         },
-        "candidate_worthy": {
-            "type": "noul",
-            "instructions": (
-                "Does planner.result contain a concrete defect observation specific enough that "
-                "opening or joining a RAPTOR candidate would be warranted? Opening a candidate only raises scrutiny."
-            ),
-        },
-        "deterministic_check_available": {
-            "type": "noul",
-            "instructions": "Is there a bounded deterministic check/test/query/diff that should run before another frontier-model reasoning step?",
-        },
-        "frontier_review_needed": {
-            "type": "noul",
-            "instructions": "Does the result need deeper frontier-model synthesis or independent semantic review before the planner can choose a concrete next step?",
-        },
     }
+    for name, instruction in ROUTE_SIGNALS.items():
+        questions[f"route__{name}"] = {
+            "type": "noul",
+            "instructions": instruction + " Treat this as an independent additive follow-up judgment; several routes may simultaneously apply.",
+        }
+    return questions
 
 
 def _load_json_arg(arg: str):
@@ -425,8 +382,6 @@ def _collect_next_action(response: dict, state: dict, mode: str) -> dict:
             "gain": answers.get(f"gain__{aid}"),
             "duplicate_risk": answers.get(f"duplicate_risk__{aid}"),
             "deterministic_first": answers.get(f"deterministic_first__{aid}"),
-            "frontier_needed": answers.get(f"frontier_needed__{aid}"),
-            "executor": answers.get(f"executor__{aid}"),
         }
 
     mandatory = sorted(
@@ -452,19 +407,32 @@ def _collect_next_action(response: dict, state: dict, mode: str) -> dict:
     }
 
 
+def _noul_value(answer) -> float:
+    if isinstance(answer, dict):
+        try:
+            return float(answer.get("noul", 0.0))
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
 def _collect_route(response: dict, mode: str) -> dict:
     answers = response.get("answers", {})
-    route = _answer_choice(answers, "route") or {}
+    route_signals = {name: answers.get(f"route__{name}") for name in ROUTE_SIGNALS}
+    ranked = sorted(
+        ({"route": name, "probability": _noul_value(ans)} for name, ans in route_signals.items()),
+        key=lambda row: (-row["probability"], row["route"]),
+    )
     return {
-        "recommended_route": route.get("choice"),
-        "recommendation": route,
         "signals": {
             "contains_new_claim": answers.get("contains_new_claim"),
-            "candidate_worthy": answers.get("candidate_worthy"),
-            "deterministic_check_available": answers.get("deterministic_check_available"),
-            "frontier_review_needed": answers.get("frontier_review_needed"),
+            **route_signals,
         },
-        "policy_selected_route": route.get("choice") if mode == "reorder" else None,
+        "ranked_routes": ranked,
+        # Result routes are intentionally not auto-selected in v2, even in reorder mode.
+        # They are non-exclusive; shadow data must calibrate composition policy first.
+        "policy_selected_routes": [],
+        "reorder_enabled_for_result_routes": False,
     }
 
 
